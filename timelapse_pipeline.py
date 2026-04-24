@@ -59,9 +59,9 @@ def main():
     # ============================================================
 
     # --- IDENTIFICACIÓN DEL TIMELAPSE ---
-    mission  = "ISS042"
-    start_id = 179159
-    end_id   = 179733
+    mission  = "ISS067"
+    start_id = 366800
+    end_id   = 366816
 
     # Carpeta base del experimento, estilo: ISS053-E-462550-462560
     base_dir = Path(f"{mission}-E-{start_id}-{end_id}")
@@ -88,51 +88,60 @@ def main():
 
     earth_radius = 10.0
 
-    # --- CONTROL: usar o no angle_search ---
-    use_angle_search =  False  # ponlo a False si quieres meter yaw/pitch a mano
-    reuse_cached_angles = True 
+        # --- CONTROL: usar o no angle_search ---
+    use_angle_search = True
+    reuse_cached_angles = True
 
     # ¿Recalcular SIEMPRE la simulación aunque ya existan renders?
-    # False = si ya hay 'render_output_*.png' en output_dir, se salta generate_timelapse
     rerun_simulation_if_exists = False
 
     # --- CONTROL: usar o no flujo óptico + segunda georef ---
-    use_optical_flow = True  # si False, la pipeline termina tras la 1ª georreferenciación
+    use_optical_flow = True
 
     # "none"  → solo generar corrected_points y terminar sin 2ª georef
     # "full"  → 2ª georreferenciación de TODO el timelapse
-    # "sample"→ 2ª georef solo de unas pocas imágenes de comprobación
-    second_georef_mode = "sample"  # "none" | "full" | "sample"
+    # "sample"→ 2ª georef solo unas imágenes de comprobación
+    second_georef_mode = "sample"
 
-    # --- ÁNGULOS DE LA CÁMARA (valor inicial / fallback) ---
-    yaw   =  10
-    pitch = 60
-    roll  = -5
+    # --- ÁNGULOS DE LA CÁMARA (fallback) ---
+    yaw = 0.0
+    pitch = 60.0
+    roll = 0.0
 
-    # Modo de orientación de la cámara en iss_simulation.creaimagen:
-    #   'north'   → el pitch se levanta hacia el norte geográfico.
-    #   'forward' → el pitch se levanta hacia la dirección de movimiento de la ISS.
+    # Modo de orientación
     orientation_mode = "forward"
 
-    # Paso temporal del timelapse simulado (segundos entre frames)
-    delta = 1.0
+    # Paso temporal del timelapse simulado
+    delta = 2.0 / 3.0
 
-    # Offsets de tiempo para ajustar posibles descuadres reloj cámara / TLE
-    time_offset_seconds = 20.0
+    # Offsets temporales
+    time_offset_seconds = 0.0
     time_offset_minutes = 0.0
-    time_offset_hours   = 0.0
+    time_offset_hours = 0.0
 
-    # Parámetros de búsqueda de ángulos (si se usa angle_search)
-    yaw_range   = (0, 20)
-    pitch_range = (50, 70)
-    coarse_step = 10
-    fine_step   = 2.5
-    fine_window = 5
+    # ============================================================
+    # PARÁMETROS DE BÚSQUEDA DE ÁNGULOS (angle_search_v2)
+    # ============================================================
 
-    # Sensor físico (en mm). Puedes ajustar si conoces la cámara exacta.
-    sensor_width  = 36.0
-    sensor_height = 28.0  
+    # Rangos
+    yaw_range = (-20.0, 20.0)
+    pitch_range = (40.0, 70.0)
+    roll_range = (-15.0, 15.0)
 
+    # Búsqueda gruesa
+    coarse_steps = (10.0, 5.0, 5.0)      # (yaw, pitch, roll)
+
+    # Refinado intermedio alrededor de top-k
+    fine_steps = (2.5, 1.5, 1.0)
+    fine_windows = (5.0, 4.0, 3.0)
+
+    # Refinado final
+    refine_steps = (1.0, 0.5, 0.5)
+    refine_windows = (2.0, 1.0, 1.0)
+
+    # Sensor físico
+    sensor_width = 36.0
+    sensor_height = 28.0
     # ============================================================
     # CALCULAR NÚMERO TOTAL DE PASOS PARA LOS PRINTS
     # ============================================================
@@ -190,12 +199,16 @@ def main():
     # 4. (OPCIONAL) BÚSQUEDA DE YAW/PITCH CON angle_search.py
     #    + CACHEO DE RESULTADOS
     # ============================================================
+        # ============================================================
+    # 4. (OPCIONAL) BÚSQUEDA DE YAW/PITCH/ROLL CON angle_search_v2.py
+    #    + CACHEO DE RESULTADOS
+    # ============================================================
     if use_angle_search:
         cache_file = base_dir / "angle_search_results.txt"
 
         # 4.1. Si queremos reutilizar y ya existe un resultado guardado → cargarlo
         if reuse_cached_angles and cache_file.exists():
-            print(f"▶️  [{step}/{total_steps}] Cargando yaw/pitch desde cache (angle_search_results.txt)...")
+            print(f"▶️  [{step}/{total_steps}] Cargando yaw/pitch/roll desde cache (angle_search_results.txt)...")
             with cache_file.open("r") as f:
                 lines = [l.strip() for l in f.readlines() if l.strip()]
 
@@ -208,22 +221,28 @@ def main():
             try:
                 yaw   = float(cached.get("yaw"))
                 pitch = float(cached.get("pitch"))
+                roll  = float(cached.get("roll"))
+
                 print(f"   yaw (cache)   = {yaw}")
                 print(f"   pitch (cache) = {pitch}")
+                print(f"   roll (cache)  = {roll}")
+
                 if "score" in cached:
                     print(f"   score (cache) = {cached['score']}")
+
                 reuse_from_cache = True
+
             except Exception as e:
-                print(f"⚠️ Error leyendo cache de ángulos ({e}), recalculando con angle_search...")
+                print(f"⚠️ Error leyendo cache de ángulos ({e}), recalculando con angle_search_v2...")
                 cache_file.unlink(missing_ok=True)
                 reuse_from_cache = False
 
         else:
             reuse_from_cache = False
 
-        # 4.2. Si no hay cache usable → ejecutar angle_search y guardar resultado
+        # 4.2. Si no hay cache usable → ejecutar angle_search_v2 y guardar resultado
         if not reuse_from_cache:
-            print(f"▶️  [{step}/{total_steps}] Buscando yaw/pitch óptimos con angle_search...")
+            print(f"▶️  [{step}/{total_steps}] Buscando yaw/pitch/roll óptimos con angle_search_v2...")
 
             real_image_path = pics_dir / first_img
             obs_time = start_dt  # ya contiene offset
@@ -231,51 +250,70 @@ def main():
             # Asegúrate de que la carpeta existe
             search_output_dir.mkdir(parents=True, exist_ok=True)
 
-            best_angles, (coarse_res, fine_res) = angle_search.search_best_yaw_pitch(
+            best_angles, search_details = angle_search.search_best_yaw_pitch_roll(
                 real_image_path=str(real_image_path),
                 obs_time=obs_time,
-                search_output_dir=str(base_dir / "search_angles"),
+                search_output_dir=str(search_output_dir),
                 tle_dir=str(tle_dir),
                 texture_path=texture_path,
+
                 # Parámetros de cámara extraídos del EXIF + sensores físicos
                 focal_length=focal_length,
                 sensor_width=sensor_width,
                 sensor_height=sensor_height,
                 pixel_width=pixel_width,
                 pixel_height=pixel_height,
-                # Rango de búsqueda
+
+                # Rangos de búsqueda
                 yaw_range=yaw_range,
                 pitch_range=pitch_range,
-                coarse_step=coarse_step,
-                fine_step=fine_step,
-                fine_window=fine_window,
-                roll=roll,
+                roll_range=roll_range,
+
+                # Resoluciones de búsqueda
+                coarse_steps=coarse_steps,
+                fine_steps=fine_steps,
+                fine_windows=fine_windows,
+                refine_steps=refine_steps,
+                refine_windows=refine_windows,
+
+                # Parámetros de orientación
                 orientation_mode=orientation_mode,
+                earth_radius=earth_radius,
             )
 
             if best_angles is not None:
                 yaw   = float(best_angles["yaw"])
                 pitch = float(best_angles["pitch"])
+                roll  = float(best_angles["roll"])
                 score = best_angles.get("score", None)
 
-                print("\n✅ Mejores ángulos encontrados por angle_search:")
+                print("\n✅ Mejores ángulos encontrados por angle_search_v2:")
                 print(f"   yaw   = {yaw}")
                 print(f"   pitch = {pitch}")
+                print(f"   roll  = {roll}")
                 print(f"   score = {score}")
 
                 # Guardar a cache
                 with cache_file.open("w") as f:
                     f.write(f"yaw={yaw}\n")
                     f.write(f"pitch={pitch}\n")
+                    f.write(f"roll={roll}\n")
                     if score is not None:
                         f.write(f"score={score}\n")
 
-            else:
-                print("⚠️ angle_search no devolvió ningún resultado válido. "
-                      "Usando yaw/pitch por defecto.")
+                # Opcional: guardar resumen JSON adicional
+                summary_json = base_dir / "angle_search_best_result.json"
+                try:
+                    with summary_json.open("w") as f:
+                        json.dump(best_angles, f, indent=2)
+                except Exception as e:
+                    print(f"⚠️ No se pudo guardar {summary_json.name}: {e}")
 
+            else:
+                print("⚠️ angle_search_v2 no devolvió ningún resultado válido. "
+                      "Usando yaw/pitch/roll por defecto.")
     else:
-        print("ℹ️  [2/11] Búsqueda de ángulos desactivada. "
+        print(f"ℹ️  [{step}/{total_steps}] Búsqueda de ángulos desactivada. "
               f"Usando yaw={yaw}, pitch={pitch}, roll={roll}.")
     
     step += 1
