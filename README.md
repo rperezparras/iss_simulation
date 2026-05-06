@@ -51,7 +51,7 @@ Los módulos principales son:
 7. **Filtrado de puntos** aislados y renombrado consistente
 8. **Primera georreferenciación** con GDAL
 
-### Refinamiento opcional
+### Refinamiento
 
 9. **Recorte y alineado VIIRS**
 10. **Cálculo de flujo óptico** ISS–VIIRS
