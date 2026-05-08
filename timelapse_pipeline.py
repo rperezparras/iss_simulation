@@ -194,7 +194,7 @@ def main():
     print("Rango temporal (tras offset):")
     print(f"  start_dt = {start_dt}")
     print(f"  end_dt   = {end_dt}")
-    
+
      # ============================================================
     # 3.1 CALCULAR DELTA AUTOMÁTICAMENTE
     # ============================================================
@@ -224,13 +224,10 @@ def main():
     print(f"  delta    = {delta:.6f} s")
 
     # ============================================================
-    # 4. (OPCIONAL) BÚSQUEDA DE YAW/PITCH CON angle_search.py
+    # 4. (OPCIONAL) BÚSQUEDA DE YAW/PITCH/ROLL CON angle_search.py
     #    + CACHEO DE RESULTADOS
     # ============================================================
-        # ============================================================
-    # 4. (OPCIONAL) BÚSQUEDA DE YAW/PITCH/ROLL CON angle_search_v2.py
-    #    + CACHEO DE RESULTADOS
-    # ============================================================
+    
     if use_angle_search:
         cache_file = base_dir / "angle_search_results.txt"
 
