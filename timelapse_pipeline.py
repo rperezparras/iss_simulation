@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pipeline completa timelapse ISS (scripts_v3) con recuperación robusta de pasos incompletos.
+Pipeline completa timelapse ISS (scripts_v3) con recuperación robusta.
 
 Pasos base:
 1) Descargar imágenes originales ISS.
@@ -16,18 +16,15 @@ Si use_optical_flow = True:
 9) Flujo óptico ISS-VIIRS.
 10) Corrección de puntos.
 11) Segunda georreferenciación completa, de muestra, o ninguna.
-
-La pipeline solo salta un paso si detecta que está completo y que su configuración
-coincide con la configuración actual.
 """
 
 import os
 
-# Forzar Qt a modo offscreen para evitar problemas con cv2/matplotlib.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import sys
 import json
+import math
 from pathlib import Path
 from datetime import timedelta
 from argparse import Namespace
@@ -63,9 +60,6 @@ def write_json(path: Path, data: dict):
 
 
 def configs_equal(a, b) -> bool:
-    """
-    Comparación simple y estable de configuraciones serializables.
-    """
     try:
         return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
     except Exception:
@@ -86,6 +80,11 @@ def count_nonempty(folder: Path, pattern: str) -> int:
 
 
 def is_complete(folder: Path, pattern: str, expected: int, label: str) -> bool:
+    """
+    Considera completo un paso si hay al menos expected archivos no vacíos.
+
+    Si hay más de los esperados, no se detiene la pipeline: se avisa y continúa.
+    """
     files = nonempty_files(folder, pattern)
     n = len(files)
 
@@ -93,12 +92,17 @@ def is_complete(folder: Path, pattern: str, expected: int, label: str) -> bool:
         print(f"   OK {label}: completo ({n}/{expected}).")
         return True
 
+    if n > expected:
+        print(
+            f"   AVISO {label}: hay más archivos de los esperados "
+            f"({n}/{expected}). Se continuará usando los necesarios."
+        )
+        return True
+
     if n == 0:
         print(f"   INFO {label}: no existe aún (0/{expected}).")
-    elif n < expected:
-        print(f"   AVISO {label}: incompleto ({n}/{expected}).")
     else:
-        print(f"   AVISO {label}: hay más archivos de los esperados ({n}/{expected}).")
+        print(f"   AVISO {label}: incompleto ({n}/{expected}).")
 
     return False
 
@@ -135,8 +139,11 @@ def step_should_run(
     Ejecuta si:
     - force_this_step es True;
     - force_downstream es True;
-    - el número de archivos esperados no coincide;
-    - falta config_file o no coincide con current_config.
+    - no hay suficientes archivos;
+    - la configuración guardada no coincide con la actual.
+
+    Si los outputs están completos pero falta el JSON de configuración,
+    se asume válido y se escribe la configuración actual.
     """
     if force_this_step:
         print(f"   AVISO {label}: forzado por configuración.")
@@ -152,34 +159,44 @@ def step_should_run(
 
     if config_file is not None and current_config is not None:
         old_config = read_json(config_file)
+
+        if old_config is None:
+            print(
+                f"   AVISO {label}: outputs completos pero falta el archivo de configuración. "
+                "Se asumirá válido y se escribirá la configuración actual."
+            )
+            write_json(config_file, current_config)
+            return False
+
         if not configs_equal(old_config, current_config):
-            print(f"   AVISO {label}: configuración distinta o inexistente. Se recalculará.")
+            print(f"   AVISO {label}: configuración distinta. Se recalculará.")
             return True
 
     return False
 
 
 def extract_id_from_filename(name: str) -> int | None:
-    """
-    Espera nombres tipo ISS067-E-327360.points o similares.
-    """
     try:
         return int(name.split("-")[-1].split(".")[0])
     except Exception:
         return None
 
 
-def count_points_in_range(folder: Path, start_id: int, end_id: int) -> int:
+def ids_from_points_dir(folder: Path, start_id: int, end_id: int):
     if not folder.exists():
-        return 0
+        return []
 
-    files = []
+    ids = []
     for f in folder.glob("*.points"):
         sid = extract_id_from_filename(f.name)
         if sid is not None and start_id <= sid <= end_id and f.stat().st_size > 0:
-            files.append(f)
+            ids.append(sid)
 
-    return len(files)
+    return sorted(set(ids))
+
+
+def count_points_in_range(folder: Path, start_id: int, end_id: int) -> int:
+    return len(ids_from_points_dir(folder, start_id, end_id))
 
 
 def remove_points_in_range(folder: Path, start_id: int, end_id: int, label: str):
@@ -201,23 +218,19 @@ def remove_points_in_range(folder: Path, start_id: int, end_id: int, label: str)
                 print(f"      AVISO: no se pudo borrar {p}: {e}")
 
 
-def sample_ids_for_range(start_id: int, end_id: int, n_samples: int = 10):
-    if end_id <= start_id:
-        return [start_id]
+def sample_ids_from_available(available_ids, n_samples: int = 10):
+    available_ids = sorted(set(available_ids))
+    if not available_ids:
+        return []
 
-    step_id = max(1, (end_id - start_id) // (n_samples - 1))
-    sample_ids = [start_id + i * step_id for i in range(n_samples - 1)]
-    sample_ids.append(end_id)
+    if len(available_ids) <= n_samples:
+        return available_ids
 
-    sample_ids = sorted({sid for sid in sample_ids if start_id <= sid <= end_id})
-
-    sid = start_id
-    while len(sample_ids) < n_samples and sid <= end_id:
-        sample_ids.append(sid)
-        sample_ids = sorted(set(sample_ids))
-        sid += 1
-
-    return sample_ids
+    idxs = [
+        round(i * (len(available_ids) - 1) / (n_samples - 1))
+        for i in range(n_samples)
+    ]
+    return [available_ids[i] for i in idxs]
 
 
 def geo_file_for_id_exists(folder: Path, sid: int) -> bool:
@@ -327,6 +340,7 @@ def main():
     matching_show_every = 50
     matching_min_grid_points = 30
     matching_plot_max_matches = 150
+    min_matching_success_ratio = 0.95
 
     # Parámetros filter_points
     filter_radius_km = 80
@@ -530,7 +544,6 @@ def main():
                 except Exception as e:
                     print(f"AVISO: no se pudo guardar {summary_json.name}: {e}")
 
-                # Si cambian los ángulos, todos los pasos posteriores dependen de ello.
                 force_downstream = True
 
             else:
@@ -602,7 +615,16 @@ def main():
     )
 
     if run_simulation:
-        remove_files(output_dir, "render_output_*.png", "renders simulados")
+        existing_render_count = count_nonempty(output_dir, "render_output_*.png")
+
+        if existing_render_count > 0 and not rerun_simulation_if_exists:
+            print(
+                f"   AVISO: hay {existing_render_count}/{n_images} renders existentes. "
+                "No se borran; se intentará continuar/regenerar sobre la misma carpeta."
+            )
+        else:
+            remove_files(output_dir, "render_output_*.png", "renders simulados")
+
         sim_config_file.unlink(missing_ok=True)
 
         Args_gen = Namespace(
@@ -625,7 +647,10 @@ def main():
         generate_timelapse.main(Args_gen)
 
         if not is_complete(output_dir, "render_output_*.png", n_images, "renders simulados"):
-            raise RuntimeError("La simulación terminó, pero el número de renders no es el esperado.")
+            print(
+                "   AVISO: la simulación terminó con menos renders de los esperados. "
+                "La pipeline continuará, pero el matching puede fallar si faltan demasiados pares."
+            )
 
         write_json(sim_config_file, sim_config)
         force_downstream = True
@@ -648,20 +673,47 @@ def main():
         "matching_show_every": matching_show_every,
         "matching_min_grid_points": matching_min_grid_points,
         "matching_plot_max_matches": matching_plot_max_matches,
+        "min_matching_success_ratio": min_matching_success_ratio,
         "match_timelapse_version": "ransac_normalized_poly_grid_visualization_v1",
     }
     match_config_file = matches_output_dir / "_match_config.json"
 
-    run_matching = step_should_run(
-        folder=matches_output_dir,
-        pattern="transformed_coordinates_*.csv",
-        expected=n_images,
-        label="CSVs de matching",
-        config_file=match_config_file,
-        current_config=match_config,
-        force_downstream=force_downstream,
-        force_this_step=rerun_matching_if_exists,
-    )
+    n_existing_csv = count_nonempty(matches_output_dir, "transformed_coordinates_*.csv")
+    min_csv = max(1, math.ceil(min_matching_success_ratio * n_images))
+
+    old_match_config = read_json(match_config_file)
+    match_outputs_ok = n_existing_csv >= min_csv
+
+    if rerun_matching_if_exists:
+        print("   AVISO matching: forzado por configuración.")
+        run_matching = True
+    elif force_downstream:
+        print("   AVISO matching: se recalculará porque un paso anterior cambió.")
+        run_matching = True
+    elif not match_outputs_ok:
+        print(
+            f"   AVISO CSVs de matching: insuficientes "
+            f"({n_existing_csv}/{n_images}). Mínimo requerido: {min_csv}."
+        )
+        run_matching = True
+    elif old_match_config is None:
+        print(
+            f"   AVISO CSVs de matching: suficientes "
+            f"({n_existing_csv}/{n_images}), pero falta config. "
+            "Se asumirá válido y se escribirá la configuración actual."
+        )
+        write_json(match_config_file, match_config)
+        run_matching = False
+    elif not configs_equal(old_match_config, match_config):
+        print("   AVISO matching: configuración distinta. Se recalculará.")
+        run_matching = True
+    else:
+        print(
+            f"   OK CSVs de matching suficientes: "
+            f"{n_existing_csv}/{n_images} "
+            f"({100 * n_existing_csv / n_images:.1f}%)."
+        )
+        run_matching = False
 
     if run_matching:
         remove_files(matches_output_dir, "transformed_coordinates_*.csv", "CSVs de matching")
@@ -684,18 +736,35 @@ def main():
             check=True,
         )
 
-        if not is_complete(
-            matches_output_dir,
-            "transformed_coordinates_*.csv",
-            n_images,
-            "CSVs de matching",
-        ):
-            raise RuntimeError("match_timelapse terminó, pero faltan CSVs de matching.")
+        n_csv = count_nonempty(matches_output_dir, "transformed_coordinates_*.csv")
+
+        if n_csv < min_csv:
+            raise RuntimeError(
+                f"match_timelapse terminó, pero hay pocos CSVs válidos: "
+                f"{n_csv}/{n_images}. Mínimo requerido: {min_csv} "
+                f"({100 * min_matching_success_ratio:.1f}%)."
+            )
+
+        if n_csv < n_images:
+            print(
+                f"   AVISO: faltan algunos CSVs de matching "
+                f"({n_csv}/{n_images}, {100 * n_csv / n_images:.1f}%). "
+                "La pipeline continuará con los frames válidos."
+            )
+        else:
+            print(f"   OK CSVs de matching: completo ({n_csv}/{n_images}).")
 
         write_json(match_config_file, match_config)
         force_downstream = True
-    else:
-        print("   Se omite matching: CSVs completos y configuración válida.")
+
+    n_valid_csv = count_nonempty(matches_output_dir, "transformed_coordinates_*.csv")
+    print(f"   Frames con CSV de matching válido: {n_valid_csv}/{n_images}")
+
+    if n_valid_csv < min_csv:
+        raise RuntimeError(
+            f"No hay suficientes CSVs válidos para continuar: "
+            f"{n_valid_csv}/{n_images}. Mínimo requerido: {min_csv}."
+        )
 
     # ============================================================
     # 7. PROYECCIÓN DE PÍXELES -> .points
@@ -710,13 +779,14 @@ def main():
         **common_config,
         "step": "project_timelapse",
         "points_mode": points_mode,
+        "n_valid_csv": n_valid_csv,
     }
     project_config_file = output_dir / "_project_config.json"
 
     run_projection = step_should_run(
         folder=output_dir,
         pattern="*_real.points",
-        expected=n_images,
+        expected=n_valid_csv,
         label="puntos proyectados *_real.points",
         config_file=project_config_file,
         current_config=project_config,
@@ -757,13 +827,19 @@ def main():
             check=True,
         )
 
-        if not is_complete(output_dir, "*_real.points", n_images, "puntos proyectados *_real.points"):
+        if not is_complete(output_dir, "*_real.points", n_valid_csv, "puntos proyectados *_real.points"):
             raise RuntimeError("project_timelapse terminó, pero faltan *_real.points.")
 
         write_json(project_config_file, project_config)
         force_downstream = True
     else:
         print("   Se omite project_timelapse: .points completos y configuración válida.")
+
+    n_projected_points = count_nonempty(output_dir, "*_real.points")
+    print(f"   Frames con puntos proyectados: {n_projected_points}/{n_images}")
+
+    if n_projected_points == 0:
+        raise RuntimeError("No hay ningún archivo *_real.points. No se puede continuar.")
 
     # ============================================================
     # 8. FILTRADO + RENOMBRADO DE .points
@@ -778,18 +854,19 @@ def main():
         **common_config,
         "step": "filter_points",
         "filter_radius_km": filter_radius_km,
+        "n_projected_points": n_projected_points,
     }
     filter_config_file = filtered_points_dir / "_filter_config.json"
 
     existing_filtered_count = count_points_in_range(filtered_points_dir, start_id, end_id)
-    filtered_complete = existing_filtered_count == n_images
+    filtered_complete = existing_filtered_count >= n_projected_points
     filter_config_ok = configs_equal(read_json(filter_config_file), filter_config)
 
     if rerun_filtering_if_exists or force_downstream or not filtered_complete or not filter_config_ok:
-        if filtered_complete and not force_downstream and filter_config_ok and rerun_filtering_if_exists:
-            print("   AVISO filtrado forzado por configuración.")
-        else:
-            print(f"   AVISO puntos filtrados: {existing_filtered_count}/{n_images}. Se recalculará.")
+        print(
+            f"   AVISO puntos filtrados: {existing_filtered_count}/{n_projected_points}. "
+            "Se recalculará."
+        )
 
         remove_points_in_range(filtered_points_dir, start_id, end_id, "puntos filtrados")
         filter_config_file.unlink(missing_ok=True)
@@ -808,15 +885,26 @@ def main():
         )
 
         existing_filtered_count = count_points_in_range(filtered_points_dir, start_id, end_id)
-        if existing_filtered_count != n_images:
+
+        if existing_filtered_count < n_projected_points:
             raise RuntimeError(
-                f"filter_points terminó, pero hay {existing_filtered_count}/{n_images} .points filtrados."
+                f"filter_points terminó, pero hay "
+                f"{existing_filtered_count}/{n_projected_points} .points filtrados."
             )
 
         write_json(filter_config_file, filter_config)
         force_downstream = True
     else:
-        print(f"   Se omite filter_points: puntos filtrados completos ({existing_filtered_count}/{n_images}).")
+        print(
+            f"   Se omite filter_points: puntos filtrados suficientes "
+            f"({existing_filtered_count}/{n_projected_points})."
+        )
+
+    n_filtered_points = count_points_in_range(filtered_points_dir, start_id, end_id)
+    print(f"   Frames con puntos filtrados: {n_filtered_points}/{n_images}")
+
+    if n_filtered_points == 0:
+        raise RuntimeError("No hay puntos filtrados. No se puede georreferenciar.")
 
     # ============================================================
     # 9. PRIMERA GEORREFERENCIACIÓN
@@ -832,13 +920,14 @@ def main():
         "step": "georef_timelapse_first",
         "georef_plot_every": georef_plot_every,
         "points_dir": str(filtered_points_dir),
+        "n_filtered_points": n_filtered_points,
     }
     geo_config_file = geo_dir / "_geo_config.json"
 
     run_geo = step_should_run(
         folder=geo_dir,
         pattern="*_rect.tiff",
-        expected=n_images,
+        expected=n_filtered_points,
         label="GeoTIFFs primera pasada",
         config_file=geo_config_file,
         current_config=geo_config,
@@ -864,13 +953,19 @@ def main():
             check=True,
         )
 
-        if not is_complete(geo_dir, "*_rect.tiff", n_images, "GeoTIFFs primera pasada"):
+        if not is_complete(geo_dir, "*_rect.tiff", n_filtered_points, "GeoTIFFs primera pasada"):
             raise RuntimeError("georef_timelapse terminó, pero faltan GeoTIFFs de primera pasada.")
 
         write_json(geo_config_file, geo_config)
         force_downstream = True
     else:
-        print("   Se omite primera georreferenciación: GeoTIFFs completos y configuración válida.")
+        print("   Se omite primera georreferenciación: GeoTIFFs suficientes y configuración válida.")
+
+    n_geo = count_nonempty(geo_dir, "*_rect.tiff")
+    print(f"   Frames georreferenciados primera pasada: {n_geo}/{n_images}")
+
+    if n_geo == 0:
+        raise RuntimeError("No hay GeoTIFFs de primera pasada. No se puede continuar.")
 
     # ============================================================
     # SI NO HAY FLUJO ÓPTICO, TERMINAR
@@ -899,13 +994,14 @@ def main():
         "viirs_roi_margin_px": viirs_roi_margin_px,
         "viirs_align": viirs_align,
         "viirs_resampling": viirs_resampling,
+        "n_geo": n_geo,
     }
     viirs_config_file = viirs_output_dir / "_viirs_config.json"
 
     run_viirs = step_should_run(
         folder=viirs_output_dir,
         pattern="*_viirs.tiff",
-        expected=n_images,
+        expected=n_geo,
         label="recortes VIIRS alineados",
         config_file=viirs_config_file,
         current_config=viirs_config,
@@ -941,13 +1037,19 @@ def main():
             check=True,
         )
 
-        if not is_complete(viirs_output_dir, "*_viirs.tiff", n_images, "recortes VIIRS alineados"):
+        if not is_complete(viirs_output_dir, "*_viirs.tiff", n_geo, "recortes VIIRS alineados"):
             raise RuntimeError("viirs_roi_crop terminó, pero faltan recortes VIIRS.")
 
         write_json(viirs_config_file, viirs_config)
         force_downstream = True
     else:
-        print("   Se omite VIIRS: recortes completos y configuración válida.")
+        print("   Se omite VIIRS: recortes suficientes y configuración válida.")
+
+    n_viirs = count_nonempty(viirs_output_dir, "*_viirs.tiff")
+    print(f"   Frames VIIRS alineados: {n_viirs}/{n_images}")
+
+    if n_viirs == 0:
+        raise RuntimeError("No hay recortes VIIRS. No se puede calcular flujo óptico.")
 
     # ============================================================
     # 11. FLUJO ÓPTICO ISS-VIIRS
@@ -964,13 +1066,14 @@ def main():
         "optical_flow_plot_every": optical_flow_plot_every,
         "geo_dir": str(geo_dir),
         "viirs_output_dir": str(viirs_output_dir),
+        "n_viirs": n_viirs,
     }
     flow_config_file = flow_dir / "_flow_config.json"
 
     run_flow = step_should_run(
         folder=flow_dir,
         pattern="*_flow.npy",
-        expected=n_images,
+        expected=n_viirs,
         label="flujos ópticos",
         config_file=flow_config_file,
         current_config=flow_config,
@@ -1001,13 +1104,19 @@ def main():
             check=True,
         )
 
-        if not is_complete(flow_dir, "*_flow.npy", n_images, "flujos ópticos"):
+        if not is_complete(flow_dir, "*_flow.npy", n_viirs, "flujos ópticos"):
             raise RuntimeError("optical_flow terminó, pero faltan .npy de flujo.")
 
         write_json(flow_config_file, flow_config)
         force_downstream = True
     else:
-        print("   Se omite optical_flow: flujos completos y configuración válida.")
+        print("   Se omite optical_flow: flujos suficientes y configuración válida.")
+
+    n_flow = count_nonempty(flow_dir, "*_flow.npy")
+    print(f"   Frames con flujo óptico: {n_flow}/{n_images}")
+
+    if n_flow == 0:
+        raise RuntimeError("No hay flujos ópticos. No se pueden corregir puntos.")
 
     # ============================================================
     # 12. CORREGIR PUNTOS CON FLUJO
@@ -1018,19 +1127,22 @@ def main():
 
     corrected_points_dir.mkdir(parents=True, exist_ok=True)
 
+    expected_corrected = min(n_filtered_points, n_flow)
+
     corrected_config = {
         **common_config,
         "step": "correct_points",
         "filtered_points_dir": str(filtered_points_dir),
         "flow_dir": str(flow_dir),
         "geo_dir": str(geo_dir),
+        "expected_corrected": expected_corrected,
     }
     corrected_config_file = corrected_points_dir / "_corrected_points_config.json"
 
     run_correct_points = step_should_run(
         folder=corrected_points_dir,
         pattern="*.points",
-        expected=n_images,
+        expected=expected_corrected,
         label="puntos corregidos",
         config_file=corrected_config_file,
         current_config=corrected_config,
@@ -1055,13 +1167,19 @@ def main():
             check=True,
         )
 
-        if not is_complete(corrected_points_dir, "*.points", n_images, "puntos corregidos"):
+        if not is_complete(corrected_points_dir, "*.points", expected_corrected, "puntos corregidos"):
             raise RuntimeError("correct_points terminó, pero faltan puntos corregidos.")
 
         write_json(corrected_config_file, corrected_config)
         force_downstream = True
     else:
-        print("   Se omite correct_points: puntos corregidos completos y configuración válida.")
+        print("   Se omite correct_points: puntos corregidos suficientes y configuración válida.")
+
+    n_corrected_points = count_nonempty(corrected_points_dir, "*.points")
+    print(f"   Frames con puntos corregidos: {n_corrected_points}/{n_images}")
+
+    if n_corrected_points == 0:
+        raise RuntimeError("No hay puntos corregidos. No se puede hacer segunda georreferenciación.")
 
     # ============================================================
     # 13. SEGUNDA GEORREFERENCIACIÓN
@@ -1081,13 +1199,14 @@ def main():
             "step": "georef_timelapse_corrected_full",
             "points_dir": str(corrected_points_dir),
             "georef_plot_every": georef_plot_every,
+            "n_corrected_points": n_corrected_points,
         }
         geo_corrected_config_file = geo_corrected_dir / "_geo_corrected_config.json"
 
         run_geo_corrected = step_should_run(
             folder=geo_corrected_dir,
             pattern="*_rect.tiff",
-            expected=n_images,
+            expected=n_corrected_points,
             label="GeoTIFFs segunda georreferenciación",
             config_file=geo_corrected_config_file,
             current_config=geo_corrected_config,
@@ -1116,7 +1235,7 @@ def main():
             if not is_complete(
                 geo_corrected_dir,
                 "*_rect.tiff",
-                n_images,
+                n_corrected_points,
                 "GeoTIFFs segunda georreferenciación",
             ):
                 raise RuntimeError("Segunda georreferenciación terminó, pero faltan GeoTIFFs.")
@@ -1129,7 +1248,12 @@ def main():
     if second_georef_mode == "sample":
         print(f"[{step}/{total_steps}] Segunda georreferenciación de muestra con puntos corregidos...")
 
-        sample_ids = sample_ids_for_range(start_id, end_id, n_samples=10)
+        available_corrected_ids = ids_from_points_dir(corrected_points_dir, start_id, end_id)
+        sample_ids = sample_ids_from_available(available_corrected_ids, n_samples=10)
+
+        if not sample_ids:
+            raise RuntimeError("No hay IDs corregidos disponibles para la georreferenciación de muestra.")
+
         print(f"   IDs de muestra ({len(sample_ids)}): {sample_ids}")
 
         sample_config = {
@@ -1137,6 +1261,7 @@ def main():
             "step": "georef_timelapse_corrected_sample",
             "points_dir": str(corrected_points_dir),
             "sample_ids": sample_ids,
+            "n_corrected_points": n_corrected_points,
         }
         sample_config_file = geo_corrected_dir / "_geo_corrected_sample_config.json"
 
@@ -1154,7 +1279,6 @@ def main():
             print("   Se recalculará la segunda georreferenciación de muestra.")
 
             for sid in sample_ids:
-                # Limpiar outputs previos de ese ID concreto, si existen.
                 for p in geo_corrected_dir.glob(f"*{sid}*"):
                     if p.is_file():
                         try:

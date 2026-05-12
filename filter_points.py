@@ -3,6 +3,8 @@ import os
 from glob import glob
 import argparse
 
+import re 
+
 import numpy as np
 import pandas as pd
 from sklearn.neighbors import BallTree
@@ -45,7 +47,18 @@ def filter_and_rename_points(
         print("   Se continuará igualmente, usando los archivos ordenados por nombre.\n")
 
     for idx, file_path in enumerate(point_files):
-        current_id = start_id + idx
+        base = os.path.basename(file_path)
+
+        parsed_id = extract_id_from_point_filename(base)
+        if parsed_id is not None:
+            current_id = parsed_id
+        else:
+            current_id = start_id + idx
+
+        if current_id < start_id or current_id > end_id:
+            print(f"⚠️ {base}: ID {current_id} fuera de rango, se salta.")
+            continue
+
         new_filename = f"{mission}-E-{current_id}.points"
         output_path = os.path.join(output_folder, new_filename)
 
@@ -80,6 +93,18 @@ def filter_and_rename_points(
             print(f"❌ Error procesando {file_path}: {e}")
 
     print("\n✔️ Filtrado y renombrado completado.")
+
+def extract_id_from_point_filename(name: str) -> int | None:
+    """
+    Extrae el ID real desde nombres como:
+      ISS067-E-327041_real.points
+      ISS067-E-327041.points
+      coordinates_...   -> None
+    """
+    m = re.search(r"ISS\d+-E-(\d+)", name)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 def parse_args():

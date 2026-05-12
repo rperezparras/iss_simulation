@@ -133,6 +133,52 @@ def parse_args() -> argparse.Namespace:
 
     return parser.parse_args()
 
+def parse_time_from_render_filename(render_filename: str) -> datetime:
+    """
+    Extrae el timestamp desde un nombre tipo:
+
+    render_output_2022-09-05T00-20-44-965_L50-25_G22-94_...
+    """
+    stem = Path(render_filename).stem
+
+    prefix = "render_output_"
+    if not stem.startswith(prefix):
+        raise ValueError(f"Nombre de render no esperado: {render_filename}")
+
+    rest = stem[len(prefix):]
+    timestamp_str = rest.split("_L", 1)[0]
+
+    dt = datetime.strptime(timestamp_str, "%Y-%m-%dT%H-%M-%S-%f")
+    return dt.replace(tzinfo=timezone.utc)
+
+
+def find_csv_for_render(csv_files: list[str], render_filename: str) -> str | None:
+    """
+    Busca el CSV exacto asociado a un render.
+
+    Si render_filename es:
+      render_output_XXX.png
+
+    busca:
+      transformed_coordinates_render_output_XXX.csv
+    """
+    render_stem = Path(render_filename).stem
+    exact_name = f"transformed_coordinates_{render_stem}.csv"
+
+    if exact_name in csv_files:
+        return exact_name
+
+    # Fallback por prefijo, por si hay pequeñas variantes.
+    expected_prefix = f"transformed_coordinates_{render_stem}"
+    return next((f for f in csv_files if f.startswith(expected_prefix)), None)
+
+
+def image_id_from_filename(image_filename: str) -> str:
+    """
+    Devuelve ISS067-E-327041 a partir de ISS067-E-327041.JPG.
+    """
+    return Path(image_filename).stem
+
 
 def main():
     args = parse_args()
@@ -192,58 +238,85 @@ def main():
     image_index = 0
 
     # Loop temporal: igual filosofía que generate_timelapse
-    while current_time <= end_date and image_index < len(image_files):
+    # Renders simulados ya existentes. Deben ser los mismos que usó match_timelapse.
+    render_files = sorted([
+        f for f in os.listdir(output_directory)
+        if f.startswith("render_output_") and f.lower().endswith(".png")
+    ])
 
-        # Este timestamp debe coincidir con el que se usó en generate_timelapse
-        # para nombrar render_output_... y en match_timelapse para los CSV.
-        timestamp_str = current_time.strftime("%Y-%m-%dT%H-%M-%S-%f")[:-3]
+    if not render_files:
+        raise RuntimeError(f"No se encontraron renders simulados en {output_directory}")
 
-        # CSV generado por match_timelapse
-        expected_prefix = f"transformed_coordinates_render_output_{timestamp_str}"
-        csv_file = next(
-            (f for f in csv_files if f.startswith(expected_prefix)),
-            None
+    n_pairs = min(len(render_files), len(image_files))
+
+    if len(render_files) != len(image_files):
+        print(
+            f"⚠️ Número distinto de renders e imágenes reales: "
+            f"{len(render_files)} renders vs {len(image_files)} imágenes. "
+            f"Se usarán {n_pairs} pares por orden, igual que match_timelapse.py."
         )
 
+    csv_set = set(csv_files)
+
+    processed = 0
+    skipped_no_csv = 0
+    skipped_bad_image = 0
+
+    # Emparejar exactamente igual que match_timelapse.py:
+    # render_files ordenados ↔ image_files ordenadas.
+    for image_index, (render_file, image_file) in enumerate(
+        zip(render_files[:n_pairs], image_files[:n_pairs])
+    ):
+        csv_file = find_csv_for_render(csv_files, render_file)
+
         if csv_file is None:
-            print(f"⚠️ No se encontró archivo CSV para {timestamp_str}, saltando frame.")
-            current_time += time_step
-            image_index += 1
+            print(
+                f"⚠️ No se encontró CSV para render {render_file}, "
+                f"imagen real {image_file}. Saltando frame."
+            )
+            skipped_no_csv += 1
+            continue
+
+        try:
+            current_time = parse_time_from_render_filename(render_file)
+        except Exception as e:
+            print(f"⚠️ No se pudo extraer timestamp de {render_file}: {e}. Saltando frame.")
+            skipped_no_csv += 1
             continue
 
         csv_path = csv_dir / csv_file
-        image_file = image_files[image_index]
         image_path = image_dir / image_file
 
         real_photo = cv2.imread(str(image_path))
         if real_photo is None:
             print(f"⚠️ No se pudo leer la imagen {image_path}, saltando frame.")
-            current_time += time_step
-            image_index += 1
+            skipped_bad_image += 1
             continue
 
         real_photo_height = real_photo.shape[0]
 
-        print(f"[Procesando] tiempo={timestamp_str}")
+        timestamp_str = current_time.strftime("%Y-%m-%dT%H-%M-%S-%f")[:-3]
+
+        print(f"[Procesando] idx={image_index}, tiempo={timestamp_str}")
+        print(f"   Render: {render_file}")
         print(f"   CSV:    {csv_file}")
         print(f"   Imagen: {image_file} (altura real = {real_photo_height}px)")
 
-        # TLE más cercano para el instante actual
         closest_tle = find_closest_tle(tle_data, current_time)
         check_tle_validity(closest_tle, current_time)
 
-        latitude, longitude, altitude, v_icrf, v_itrs = get_iss_position_and_velocity(closest_tle, current_time)
-        velocity = v_itrs  # para forward (recomendado)
+        latitude, longitude, altitude, v_icrf, v_itrs = get_iss_position_and_velocity(
+            closest_tle,
+            current_time,
+        )
+        velocity = v_itrs
 
         observation_time_str = current_time.strftime("%Y-%m-%dT%H:%M:%S.%f")
 
-        # Antes de proyectar, anotamos qué .points existen ya,
-        # para poder saber cuáles son nuevos y aplicar points_mode.
         before_points = set(
             f for f in os.listdir(output_directory) if f.endswith(".points")
         )
 
-        # Crear la cámara en Blender, SIN renderizar imagen
         camera, _ = creaimagen(
             latitude, longitude, altitude,
             args.yaw, args.pitch, args.roll,
@@ -255,7 +328,6 @@ def main():
             orientation_mode=args.orientation_mode,
         )
 
-        # Proyectar píxeles (usa los sim_x/sim_y del CSV y la cámara recién creada)
         project_pixels(
             str(csv_path),
             latitude, longitude, altitude,
@@ -265,13 +337,39 @@ def main():
             str(output_directory), 10,
         )
 
-        # Después de proyectar, vemos qué .points nuevos se han creado
         after_points = set(
             f for f in os.listdir(output_directory) if f.endswith(".points")
         )
         new_points = after_points - before_points
 
-        # Filtramos según points_mode
+        # Renombrar los puntos nuevos para incluir el ID real de imagen.
+        # Esto evita descuadres posteriores si faltan algunos frames.
+        img_id = image_id_from_filename(image_file)
+
+        renamed_points = set()
+        for fname in new_points:
+            src = output_directory / fname
+
+            if fname.endswith("_real.points"):
+                dst = output_directory / f"{img_id}_real.points"
+            elif fname.endswith("_simulated.points"):
+                dst = output_directory / f"{img_id}_simulated.points"
+            else:
+                renamed_points.add(fname)
+                continue
+
+            try:
+                if dst.exists():
+                    dst.unlink()
+                src.rename(dst)
+                renamed_points.add(dst.name)
+            except Exception as e:
+                print(f"⚠️ No se pudo renombrar {fname} -> {dst.name}: {e}")
+                renamed_points.add(fname)
+
+        new_points = renamed_points
+
+        # Filtrar según points_mode
         if args.points_mode == "real":
             for fname in new_points:
                 if fname.endswith("_simulated.points"):
@@ -279,6 +377,7 @@ def main():
                         os.remove(output_directory / fname)
                     except Exception as e:
                         print(f"⚠️ No se pudo borrar {fname}: {e}")
+
         elif args.points_mode == "simulated":
             for fname in new_points:
                 if fname.endswith("_real.points"):
@@ -286,13 +385,17 @@ def main():
                         os.remove(output_directory / fname)
                     except Exception as e:
                         print(f"⚠️ No se pudo borrar {fname}: {e}")
-        # "both": no se borra nada
 
-        print(f"✔ Frame procesado: tiempo={timestamp_str}, CSV={csv_file}, imagen={image_file}")
+        processed += 1
+        print(
+            f"✔ Frame procesado: idx={image_index}, "
+            f"imagen={image_file}, CSV={csv_file}"
+        )
 
-        current_time += time_step
-        image_index += 1
-
+    print("✅ Todos los pares render-imagen han sido revisados.")
+    print(f"   Frames proyectados: {processed}")
+    print(f"   Sin CSV:            {skipped_no_csv}")
+    print(f"   Imagen ilegible:    {skipped_bad_image}")
     print("✅ Todos los frames del timelapse han sido procesados.")
 
 
