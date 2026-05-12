@@ -248,34 +248,167 @@ def apply_polynomial_transform(
     return poly_transform, transformed_points
 
 
-def generate_grid_points(img_width, img_height, step=100):
-    points = []
-    for y in range(0, img_height, step):
-        for x in range(0, img_width, step):
-            points.append((x, y))
-    return np.array(points)
+def generate_grid_mesh(img_width, img_height, step=100, min_points=30):
+    """
+    Genera una rejilla aproximadamente regular que cubre toda la imagen.
+
+    A diferencia de range(0, width, step), esta versión usa linspace:
+      - llega exactamente a los bordes;
+      - evita una última fila/columna mucho más pequeña;
+      - devuelve también nx, ny para poder dibujar la rejilla como malla.
+    """
+    img_width = int(img_width)
+    img_height = int(img_height)
+    step = max(1, int(step))
+
+    nx = max(2, int(round((img_width - 1) / step)) + 1)
+    ny = max(2, int(round((img_height - 1) / step)) + 1)
+
+    # Asegurar un mínimo razonable de puntos para georreferenciar.
+    while nx * ny < min_points:
+        if img_width / nx >= img_height / ny:
+            nx += 1
+        else:
+            ny += 1
+
+    xs = np.linspace(0, img_width - 1, nx, dtype=np.float64)
+    ys = np.linspace(0, img_height - 1, ny, dtype=np.float64)
+
+    xx, yy = np.meshgrid(xs, ys)
+    points = np.stack([xx.ravel(), yy.ravel()], axis=1)
+
+    return points, nx, ny
 
 
-def draw_matches(img1, img2, mkpts0, mkpts1, title, save_path=None):
-    img_combined = np.concatenate((img1, img2), axis=1)
-    offset = img1.shape[1]
-    mkpts1_offset = [(pt[0] + offset, pt[1]) for pt in mkpts1]
+def generate_grid_points(img_width, img_height, step=100, min_points=30):
+    """
+    Compatibilidad con el código anterior: devuelve solo los puntos.
+    """
+    points, _, _ = generate_grid_mesh(
+        img_width,
+        img_height,
+        step=step,
+        min_points=min_points,
+    )
+    return points
 
-    for pt0, pt1 in zip(mkpts0, mkpts1_offset):
-        pt0 = tuple(map(int, pt0))
-        pt1 = tuple(map(int, pt1))
-        cv2.line(img_combined, pt0, pt1, color=(0, 255, 0), thickness=2)
 
-    plt.figure(figsize=(12, 6))
-    plt.imshow(cv2.cvtColor(img_combined, cv2.COLOR_BGR2RGB))
-    plt.title(title)
-    plt.axis("off")
-    if save_path:
-        plt.savefig(save_path, bbox_inches="tight")
-        plt.close()
+def draw_grid(ax, grid_points, nx, ny, color="lime", lw=0.9, alpha=0.95):
+    """
+    Dibuja una rejilla a partir de puntos ordenados como meshgrid.
+    """
+    grid = grid_points.reshape(ny, nx, 2)
+
+    # Líneas horizontales
+    for iy in range(ny):
+        pts = grid[iy, :, :]
+        ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=lw, alpha=alpha)
+
+    # Líneas verticales
+    for ix in range(nx):
+        pts = grid[:, ix, :]
+        ax.plot(pts[:, 0], pts[:, 1], color=color, linewidth=lw, alpha=alpha)
+
+
+def save_grid_overlay(
+    image_bgr,
+    grid_points,
+    nx,
+    ny,
+    title,
+    save_path,
+    color="lime",
+):
+    """
+    Guarda una imagen con una rejilla encima.
+    """
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.imshow(image_rgb, origin="upper")
+    draw_grid(ax, grid_points, nx, ny, color=color)
+
+    ax.set_title(title)
+    ax.set_xlim(0, image_bgr.shape[1])
+    ax.set_ylim(image_bgr.shape[0], 0)
+    ax.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=180, bbox_inches="tight")
+    plt.close()
+
+
+def draw_matches_colorful(
+    img_real_bgr,
+    img_sim_bgr,
+    mkpts_real,
+    mkpts_sim,
+    title,
+    save_path,
+    max_matches=150,
+    seed=1234,
+):
+    """
+    Guarda un plot lado a lado:
+      izquierda = imagen real
+      derecha   = imagen simulada
+
+    Dibuja matches inliers real -> simulada con colores visuales.
+    Los colores NO codifican calidad; solo ayudan a distinguir líneas.
+    """
+    real_rgb = cv2.cvtColor(img_real_bgr, cv2.COLOR_BGR2RGB)
+    sim_rgb = cv2.cvtColor(img_sim_bgr, cv2.COLOR_BGR2RGB)
+
+    h_real, w_real = real_rgb.shape[:2]
+    h_sim, w_sim = sim_rgb.shape[:2]
+
+    mkpts_real_plot_all = np.asarray(mkpts_real, dtype=np.float64).copy()
+    mkpts_sim_plot_all = np.asarray(mkpts_sim, dtype=np.float64).copy()
+
+    # Para visualizar lado a lado, si las alturas difieren, redimensionamos solo el plot.
+    if h_real != h_sim:
+        scale = h_real / max(h_sim, 1)
+        new_w = int(round(w_sim * scale))
+        sim_rgb = cv2.resize(sim_rgb, (new_w, h_real), interpolation=cv2.INTER_AREA)
+        mkpts_sim_plot_all[:, 0] *= scale
+        mkpts_sim_plot_all[:, 1] *= scale
+        h_sim, w_sim = sim_rgb.shape[:2]
+
+    n = len(mkpts_real_plot_all)
+    if n == 0:
+        return
+
+    if n > max_matches:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(n, size=max_matches, replace=False)
+        mkpts_real_plot = mkpts_real_plot_all[idx]
+        mkpts_sim_plot = mkpts_sim_plot_all[idx]
     else:
-        plt.show()
+        mkpts_real_plot = mkpts_real_plot_all
+        mkpts_sim_plot = mkpts_sim_plot_all
 
+    canvas = np.concatenate([real_rgb, sim_rgb], axis=1)
+    offset_x = w_real
+
+    fig, ax = plt.subplots(figsize=(16, 8))
+    ax.imshow(canvas)
+
+    cmap = plt.get_cmap("turbo")
+    colors = cmap(np.linspace(0, 1, len(mkpts_real_plot)))
+
+    for p_real, p_sim, color in zip(mkpts_real_plot, mkpts_sim_plot, colors):
+        x0, y0 = float(p_real[0]), float(p_real[1])
+        x1, y1 = float(p_sim[0]) + offset_x, float(p_sim[1])
+
+        ax.plot([x0, x1], [y0, y1], color=color, linewidth=0.7, alpha=0.65)
+        ax.scatter([x0, x1], [y0, y1], color=color, s=8, alpha=0.85)
+
+    ax.set_title(f"{title} | dibujados {len(mkpts_real_plot)}/{n} inliers")
+    ax.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=180, bbox_inches="tight")
+    plt.close()
 
 # ----------------------------
 # MAIN
@@ -289,6 +422,18 @@ def main(args: argparse.Namespace | None = None):
         parser.add_argument("--matches_output_dir", type=str, required=True)
         parser.add_argument("--grid_step", type=int, default=265)
         parser.add_argument("--show_every", type=int, default=100)
+        parser.add_argument(
+            "--min_grid_points",
+            type=int,
+            default=30,
+            help="Número mínimo de puntos de rejilla válidos deseado.",
+        )
+        parser.add_argument(
+            "--plot_max_matches",
+            type=int,
+            default=150,
+            help="Número máximo de matches a dibujar en los plots.",
+        )
 
         # NUEVO (opcionales, no rompen pipeline)
         parser.add_argument("--device", type=str, default=None, choices=["cpu", "cuda"])
@@ -297,6 +442,12 @@ def main(args: argparse.Namespace | None = None):
         parser.add_argument("--min_matches", type=int, default=20)
         parser.add_argument("--no_orb_fallback", action="store_true")
         args = parser.parse_args()
+
+    # Compatibilidad si main(args) se llama desde otra pipeline con un Namespace antiguo
+    if not hasattr(args, "min_grid_points"):
+        args.min_grid_points = 30
+    if not hasattr(args, "plot_max_matches"):
+        args.plot_max_matches = 150
 
     output_dir = Path(args.output_dir).expanduser()
     pictures_dir = Path(args.pictures_dir).expanduser()
@@ -440,7 +591,12 @@ def main(args: argparse.Namespace | None = None):
             continue
 
         # ---- Grid en real
-        real_points = generate_grid_points(w1, h1, step=args.grid_step)
+        real_points, grid_nx, grid_ny = generate_grid_mesh(
+            w1,
+            h1,
+            step=args.grid_step,
+            min_points=args.min_grid_points,
+        )
 
         # ---- Transform real->sim (src=real, dst=sim)
         poly_transform, transformed_grid_points = apply_polynomial_transform(
@@ -491,19 +647,57 @@ def main(args: argparse.Namespace | None = None):
                 w.writerow([sim_x, sim_y, real_x, real_y])
 
         # ---- Plots cada N
-        if idx % args.show_every == 0:
-            # métricas rápidas
+        if args.show_every > 0 and idx % args.show_every == 0:
+            # Métricas rápidas
             img0_gray = cv2.cvtColor(img0_bgr, cv2.COLOR_BGR2GRAY)
             img1_gray = cv2.cvtColor(img1_bgr, cv2.COLOR_BGR2GRAY)
             try:
                 ssim_value = ssim(img1_gray, img0_gray)
             except Exception:
                 ssim_value = None
-            print(f"Procesando par {idx}: {img0_file} vs {img1_file} | matches={len(mkpts0)} | SSIM={ssim_value}")
 
-            match_img_path = matches_output_dir / f"matches_{idx}.png"
-            draw_matches(img0_bgr, img1_bgr, mkpts0, mkpts1,
-                         f"Matches sim-real (idx={idx})", save_path=str(match_img_path))
+            print(
+                f"Procesando par {idx}: {img0_file} vs {img1_file} | "
+                f"inliers={len(mkpts0)} | "
+                f"grid_valid={len(real_points_valid)}/{len(real_points)} | "
+                f"SSIM={ssim_value}"
+            )
+
+            # 1) Matches real-sim con colores
+            match_img_path = matches_output_dir / f"matches_color_{idx}.png"
+            draw_matches_colorful(
+                img_real_bgr=img1_bgr,
+                img_sim_bgr=img0_bgr,
+                mkpts_real=mkpts1,
+                mkpts_sim=mkpts0,
+                title=f"Matches real-sim inliers (idx={idx})",
+                save_path=str(match_img_path),
+                max_matches=args.plot_max_matches,
+            )
+
+            # 2) Rejilla regular sobre imagen real
+            real_grid_path = matches_output_dir / f"grid_real_{idx}.png"
+            save_grid_overlay(
+                image_bgr=img1_bgr,
+                grid_points=real_points,
+                nx=grid_nx,
+                ny=grid_ny,
+                title=f"Imagen real + rejilla regular (idx={idx})",
+                save_path=str(real_grid_path),
+                color="lime",
+            )
+
+            # 3) Rejilla deformada sobre imagen simulada
+            sim_grid_path = matches_output_dir / f"grid_sim_deformed_{idx}.png"
+            save_grid_overlay(
+                image_bgr=img0_bgr,
+                grid_points=transformed_grid_points,
+                nx=grid_nx,
+                ny=grid_ny,
+                title=f"Imagen simulada + rejilla real transformada (idx={idx})",
+                save_path=str(sim_grid_path),
+                color="cyan",
+            )
 
     print("Proceso terminado para todos los pares.")
 
