@@ -25,6 +25,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import sys
 import json
 import math
+import re
 from pathlib import Path
 from datetime import timedelta
 from argparse import Namespace
@@ -176,10 +177,26 @@ def step_should_run(
 
 
 def extract_id_from_filename(name: str) -> int | None:
-    try:
-        return int(name.split("-")[-1].split(".")[0])
-    except Exception:
-        return None
+    """
+    Extrae el ID numérico de nombres como:
+
+      ISS067-E-327041.points
+      ISS067-E-327041_real.points
+      ISS067-E-327041_corrected.points
+      ISS067-E-327041_real_corrected.points
+
+    Devuelve 327041.
+    """
+    m = re.search(r"ISS\d+-E-(\d+)", name)
+    if m:
+        return int(m.group(1))
+
+    # Fallback: buscar un número largo al final o antes de sufijos.
+    m = re.search(r"(\d{5,8})", name)
+    if m:
+        return int(m.group(1))
+
+    return None
 
 
 def ids_from_points_dir(folder: Path, start_id: int, end_id: int):
