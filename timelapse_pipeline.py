@@ -893,10 +893,18 @@ def main():
                 sys.executable, "-m", "scripts_v3.filter_points",
                 "--input_folder", str(output_dir),
                 "--output_folder", str(filtered_points_dir),
-                "--radius_km", str(filter_radius_km),
+                "--radius_km", "40",
                 "--start_id", str(start_id),
                 "--end_id", str(end_id),
                 "--mission", mission,
+
+                # NUEVO: coherencia temporal
+                "--temporal_order", "3",
+                "--temporal_outlier_km", "80",
+                "--temporal_sigma", "3.5",
+                "--min_track_points", "6",
+                "--max_gap_frames", "8",
+                "--plot_dir", str(base_dir / "temporal_qc_plots"),
             ],
             check=True,
         )
