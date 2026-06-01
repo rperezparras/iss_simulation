@@ -195,13 +195,24 @@ class SearchConfig:
     yaw_range: Tuple[float, float] = (-180.0, 180.0)
     pitch_range: Tuple[float, float] = (30.0, 90.0)
     roll_range: Tuple[float, float] = (-15.0, 15.0)
+
+    # En modo simplex/Nelder-Mead, coarse_steps ya NO significa paso de grid,
+    # sino tamaño inicial del simplex en yaw, pitch y roll.
     coarse_steps: Tuple[float, float, float] = (20.0, 10.0, 5.0)
+
+    # Se conservan estos parámetros por compatibilidad con llamadas antiguas.
+    # refine_steps se usa como tolerancia angular aproximada de convergencia.
     fine_steps: Tuple[float, float, float] = (5.0, 2.5, 1.0)
     fine_windows: Tuple[float, float, float] = (15.0, 7.5, 4.0)
     refine_steps: Tuple[float, float, float] = (2.0, 1.0, 0.5)
     refine_windows: Tuple[float, float, float] = (4.0, 2.0, 1.0)
     topk_coarse: int = 5
     topk_fine: int = 3
+
+    # Parámetros específicos del método Nelder-Mead/simplex.
+    simplex_max_iter: int = 45
+    simplex_max_evals: int = 140
+    simplex_score_tol: float = 1e-3
 
 
 # -------------------------------------------------------------------
@@ -772,8 +783,182 @@ def frange(start: float, stop: float, step: float) -> Iterable[float]:
 
 
 # -------------------------------------------------------------------
-# BÚSQUEDA DE ORIENTACIÓN
+# BÚSQUEDA DE ORIENTACIÓN CON NELDER-MEAD / SIMPLEX
 # -------------------------------------------------------------------
+
+
+def wrap_yaw_180(yaw: float) -> float:
+    """
+    Normaliza yaw al intervalo [-180, 180).
+    """
+    return ((float(yaw) + 180.0) % 360.0) - 180.0
+
+
+def yaw_diff_deg(a: float, b: float) -> float:
+    """
+    Diferencia angular a - b en grados, respetando la circularidad de yaw.
+    """
+    return ((float(a) - float(b) + 180.0) % 360.0) - 180.0
+
+
+def angle_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """
+    Vector a - b para [yaw, pitch, roll].
+    El yaw se calcula como diferencia angular circular.
+    """
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+
+    return np.array(
+        [
+            yaw_diff_deg(a[0], b[0]),
+            a[1] - b[1],
+            a[2] - b[2],
+        ],
+        dtype=np.float64,
+    )
+
+
+def centroid_angles(points: np.ndarray) -> np.ndarray:
+    """
+    Centroide de puntos [yaw, pitch, roll].
+    Para yaw usa media circular; pitch y roll usan media ordinaria.
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError("points debe tener shape (N, 3)")
+
+    yaw_rad = np.deg2rad(points[:, 0])
+    yaw_mean = np.rad2deg(
+        np.arctan2(np.mean(np.sin(yaw_rad)), np.mean(np.cos(yaw_rad)))
+    )
+
+    return np.array(
+        [
+            wrap_yaw_180(yaw_mean),
+            float(np.mean(points[:, 1])),
+            float(np.mean(points[:, 2])),
+        ],
+        dtype=np.float64,
+    )
+
+
+def project_angle_candidate(x: np.ndarray, search_cfg: SearchConfig) -> np.ndarray:
+    """
+    Proyecta un candidato [yaw, pitch, roll] a los rangos permitidos.
+    """
+    x = np.asarray(x, dtype=np.float64).copy()
+
+    yaw_min, yaw_max = sorted(map(float, search_cfg.yaw_range))
+    pitch_min, pitch_max = sorted(map(float, search_cfg.pitch_range))
+    roll_min, roll_max = sorted(map(float, search_cfg.roll_range))
+
+    x[0] = wrap_yaw_180(x[0])
+    x[0] = float(np.clip(x[0], yaw_min, yaw_max))
+    x[1] = float(np.clip(x[1], pitch_min, pitch_max))
+    x[2] = float(np.clip(x[2], roll_min, roll_max))
+
+    return x
+
+
+def candidate_key(x: np.ndarray) -> Tuple[float, float, float]:
+    """
+    Clave estable para cachear evaluaciones de yaw/pitch/roll.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    return (
+        round(float(x[0]), 6),
+        round(float(x[1]), 6),
+        round(float(x[2]), 6),
+    )
+
+
+def simplex_diameter_deg(simplex: np.ndarray) -> float:
+    """
+    Tamaño máximo del simplex en grados, usando norma euclídea en yaw/pitch/roll.
+    """
+    simplex = np.asarray(simplex, dtype=np.float64)
+    if len(simplex) <= 1:
+        return 0.0
+
+    max_dist = 0.0
+    for i in range(len(simplex)):
+        for j in range(i + 1, len(simplex)):
+            d = angle_delta(simplex[i], simplex[j])
+            dist = float(np.linalg.norm(d))
+            max_dist = max(max_dist, dist)
+    return max_dist
+
+
+def active_angle_dimensions(search_cfg: SearchConfig, eps: float = 1e-9) -> List[int]:
+    """
+    Devuelve las dimensiones activas del problema:
+      0 = yaw, 1 = pitch, 2 = roll.
+    Si un rango tiene min == max, se considera fijo.
+    """
+    ranges = [search_cfg.yaw_range, search_cfg.pitch_range, search_cfg.roll_range]
+    active: List[int] = []
+    for i, r in enumerate(ranges):
+        r0, r1 = sorted(map(float, r))
+        if abs(r1 - r0) > eps:
+            active.append(i)
+    return active
+
+
+def build_initial_simplex(
+    center: np.ndarray,
+    steps: Tuple[float, float, float],
+    search_cfg: SearchConfig,
+) -> np.ndarray:
+    """
+    Construye el simplex inicial.
+
+    En 3D tiene 4 vértices: centro + desplazamiento en yaw, pitch y roll.
+    Si alguna dimensión está fija, se omite y el simplex pasa a ser de menor dimensión.
+    """
+    center = project_angle_candidate(center, search_cfg)
+    vertices = [center]
+
+    active_dims = active_angle_dimensions(search_cfg)
+    for dim in active_dims:
+        step = abs(float(steps[dim]))
+        if step <= 0:
+            continue
+
+        v = center.copy()
+        v[dim] += step
+        v = project_angle_candidate(v, search_cfg)
+
+        # Si el desplazamiento queda anulado por estar pegado al límite,
+        # intentamos desplazar en la dirección contraria.
+        if np.linalg.norm(angle_delta(v, center)) < 1e-9:
+            v = center.copy()
+            v[dim] -= step
+            v = project_angle_candidate(v, search_cfg)
+
+        if np.linalg.norm(angle_delta(v, center)) >= 1e-9:
+            vertices.append(v)
+
+    return np.vstack(vertices)
+
+
+def make_default_simplex_center(search_cfg: SearchConfig) -> np.ndarray:
+    """
+    Centro inicial por defecto: punto medio de los rangos.
+    """
+    yaw_min, yaw_max = sorted(map(float, search_cfg.yaw_range))
+    pitch_min, pitch_max = sorted(map(float, search_cfg.pitch_range))
+    roll_min, roll_max = sorted(map(float, search_cfg.roll_range))
+
+    return np.array(
+        [
+            0.5 * (yaw_min + yaw_max),
+            0.5 * (pitch_min + pitch_max),
+            0.5 * (roll_min + roll_max),
+        ],
+        dtype=np.float64,
+    )
+
 
 def search_best_orientation(
     real_image_path: str,
@@ -793,6 +978,16 @@ def search_best_orientation(
     warp_cfg: Optional[WarpScoreConfig] = None,
     metrics_jsonl: Optional[str] = None,
 ):
+    """
+    Busca yaw/pitch/roll maximizando el score de evaluate_candidate mediante
+    Nelder-Mead/simplex.
+
+    Importante:
+    - La función objetivo sigue siendo exactamente la misma que antes:
+      render + matching + ajuste polinomial + métricas de deformación.
+    - Lo único que cambia es la estrategia de propuesta de candidatos.
+    - En 3D el simplex es un tetraedro de 4 vértices.
+    """
     search_cfg = search_cfg or SearchConfig()
     matcher_cfg = matcher_cfg or MatcherConfig()
     warp_cfg = warp_cfg or WarpScoreConfig()
@@ -837,120 +1032,268 @@ def search_best_orientation(
         metrics_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         metrics_jsonl_path.write_text("", encoding="utf-8")
 
+    # Cache de métricas válidas usado por evaluate_candidate.
     metrics_cache: Dict[Tuple[float, float, float], Dict[str, object]] = {}
-    coarse_results: List[Dict[str, object]] = []
-    fine_results: List[Dict[str, object]] = []
-    refine_results: List[Dict[str, object]] = []
 
-    yaw_step_c, pitch_step_c, roll_step_c = search_cfg.coarse_steps
-    print("Comenzando búsqueda gruesa de yaw/pitch/roll...")
-    for yaw in frange(search_cfg.yaw_range[0], search_cfg.yaw_range[1], yaw_step_c):
-        for pitch in frange(search_cfg.pitch_range[0], search_cfg.pitch_range[1], pitch_step_c):
-            for roll in frange(search_cfg.roll_range[0], search_cfg.roll_range[1], roll_step_c):
-                info = evaluate_candidate(
-                    yaw=yaw,
-                    pitch=pitch,
-                    roll=roll,
-                    real_image_path=real_image_path,
-                    real_image_bgr=real_bgr,
-                    render_ctx=render_ctx,
-                    matcher=matcher,
-                    matcher_cfg=matcher_cfg,
-                    warp_cfg=warp_cfg,
-                    device=device,
-                    metrics_cache=metrics_cache,
-                    metrics_jsonl=metrics_jsonl_path,
-                )
-                if info is None:
-                    continue
-                coarse_results.append(info)
+    # Cache adicional que también recuerda candidatos inválidos, para no renderizar
+    # dos veces un punto que no produjo suficientes matches.
+    eval_cache: Dict[Tuple[float, float, float], Optional[Dict[str, object]]] = {}
+    simplex_results: List[Dict[str, object]] = []
 
-    if not coarse_results:
-        return None, ([], [], [])
+    invalid_score = -1.0e12
+    n_evals = 0
 
-    coarse_results = sorted(coarse_results, key=lambda d: float(d["score"]), reverse=True)
-    top_coarse = coarse_results[: search_cfg.topk_coarse]
+    # Coeficientes clásicos de Nelder-Mead.
+    alpha = 1.0   # reflexión
+    gamma = 2.0   # expansión
+    rho = 0.5     # contracción
+    sigma = 0.5   # encogimiento
 
-    print("Top coarse:")
-    for r in top_coarse[:5]:
-        print(
-            f"  yaw={r['yaw']:.2f}, pitch={r['pitch']:.2f}, roll={r['roll']:.2f}, "
-            f"score={r['score']:.4f}, cv={r['cv_rmse']:.4f}, disp={r['disp_rmse']:.4f}, "
-            f"area={r['log_area_rmse']:.4f}, aniso={r['aniso_rmse']:.4f}, cov={r['coverage']:.3f}"
+    def score_or_invalid(info: Optional[Dict[str, object]]) -> float:
+        if info is None:
+            return invalid_score
+        return float(info["score"])
+
+    def eval_vertex(x: np.ndarray) -> Tuple[np.ndarray, Optional[Dict[str, object]], float]:
+        """
+        Evalúa un candidato [yaw, pitch, roll] usando la función objetivo actual.
+        """
+        nonlocal n_evals
+
+        x = project_angle_candidate(x, search_cfg)
+        key = candidate_key(x)
+
+        if key in eval_cache:
+            info_cached = eval_cache[key]
+            return x, info_cached, score_or_invalid(info_cached)
+
+        info = evaluate_candidate(
+            yaw=float(x[0]),
+            pitch=float(x[1]),
+            roll=float(x[2]),
+            real_image_path=real_image_path,
+            real_image_bgr=real_bgr,
+            render_ctx=render_ctx,
+            matcher=matcher,
+            matcher_cfg=matcher_cfg,
+            warp_cfg=warp_cfg,
+            device=device,
+            metrics_cache=metrics_cache,
+            metrics_jsonl=metrics_jsonl_path,
         )
 
-    yaw_win_f, pitch_win_f, roll_win_f = search_cfg.fine_windows
-    yaw_step_f, pitch_step_f, roll_step_f = search_cfg.fine_steps
-    print("Comenzando búsqueda fina alrededor de los mejores coarse...")
-    visited_fine = set()
-    for center in top_coarse:
-        for yaw in frange(center["yaw"] - yaw_win_f, center["yaw"] + yaw_win_f, yaw_step_f):
-            for pitch in frange(center["pitch"] - pitch_win_f, center["pitch"] + pitch_win_f, pitch_step_f):
-                for roll in frange(center["roll"] - roll_win_f, center["roll"] + roll_win_f, roll_step_f):
-                    key = (round(float(yaw), 6), round(float(pitch), 6), round(float(roll), 6))
-                    if key in visited_fine:
-                        continue
-                    visited_fine.add(key)
-                    info = evaluate_candidate(
-                        yaw=yaw,
-                        pitch=pitch,
-                        roll=roll,
-                        real_image_path=real_image_path,
-                        real_image_bgr=real_bgr,
-                        render_ctx=render_ctx,
-                        matcher=matcher,
-                        matcher_cfg=matcher_cfg,
-                        warp_cfg=warp_cfg,
-                        device=device,
-                        metrics_cache=metrics_cache,
-                        metrics_jsonl=metrics_jsonl_path,
+        n_evals += 1
+        eval_cache[key] = info
+
+        if info is not None:
+            simplex_results.append(info)
+
+        return x, info, score_or_invalid(info)
+
+    # -------------------------------------------------------------
+    # 1) Simplex inicial
+    # -------------------------------------------------------------
+    x0 = make_default_simplex_center(search_cfg)
+    simplex = build_initial_simplex(
+        center=x0,
+        steps=search_cfg.coarse_steps,
+        search_cfg=search_cfg,
+    )
+
+    print("Comenzando búsqueda Nelder-Mead/simplex de yaw/pitch/roll...")
+    print(
+        f"  Centro inicial: yaw={x0[0]:.3f}, pitch={x0[1]:.3f}, roll={x0[2]:.3f}"
+    )
+    print(
+        f"  Vértices iniciales: {len(simplex)} | max_iter={search_cfg.simplex_max_iter} | "
+        f"max_evals={search_cfg.simplex_max_evals}"
+    )
+
+    infos: List[Optional[Dict[str, object]]] = []
+    scores: List[float] = []
+
+    for i in range(len(simplex)):
+        simplex[i], info_i, score_i = eval_vertex(simplex[i])
+        infos.append(info_i)
+        scores.append(score_i)
+
+    scores_arr = np.asarray(scores, dtype=np.float64)
+
+    # Caso degenerado: todos los ángulos están fijados.
+    if len(simplex) == 1:
+        all_valid = sorted(simplex_results, key=lambda d: float(d["score"]), reverse=True)
+        best = all_valid[0] if all_valid else None
+        return best, (all_valid, [], [])
+
+    if np.max(scores_arr) <= invalid_score / 10.0:
+        print("No se encontró ningún resultado válido en el simplex inicial.")
+        print(
+            "Prueba a ampliar los rangos o a mover el centro inicial cambiando "
+            "yaw_range/pitch_range/roll_range."
+        )
+        return None, ([], [], [])
+
+    # Tolerancia angular de parada. Usamos refine_steps como tolerancia aproximada.
+    simplex_tol_deg = max(float(v) for v in search_cfg.refine_steps)
+    score_tol = float(search_cfg.simplex_score_tol)
+
+    # -------------------------------------------------------------
+    # 2) Iteraciones Nelder-Mead
+    # -------------------------------------------------------------
+    for it in range(int(search_cfg.simplex_max_iter)):
+        # Ordenar de mejor a peor porque MAXIMIZAMOS score.
+        order = np.argsort(scores_arr)[::-1]
+        simplex = simplex[order]
+        scores_arr = scores_arr[order]
+        infos = [infos[int(i)] for i in order]
+
+        best_x = simplex[0]
+        best_score = float(scores_arr[0])
+        worst_x = simplex[-1]
+        second_worst_score = float(scores_arr[-2])
+        worst_score = float(scores_arr[-1])
+
+        diameter = simplex_diameter_deg(simplex)
+        finite_scores = scores_arr[scores_arr > invalid_score / 10.0]
+        if len(finite_scores):
+            score_span = float(np.max(finite_scores) - np.min(finite_scores))
+        else:
+            score_span = float("inf")
+
+        print(
+            f"[SIMPLEX] iter={it:02d}, evals={n_evals:03d}, "
+            f"best yaw={best_x[0]:.3f}, pitch={best_x[1]:.3f}, roll={best_x[2]:.3f}, "
+            f"score={best_score:.5f}, diameter={diameter:.3f}, score_span={score_span:.6f}"
+        )
+
+        if diameter <= simplex_tol_deg and score_span <= score_tol:
+            print(
+                f"Convergencia simplex: diameter={diameter:.4f}, "
+                f"score_span={score_span:.6f}"
+            )
+            break
+
+        if n_evals >= int(search_cfg.simplex_max_evals):
+            print(f"Parada por simplex_max_evals={search_cfg.simplex_max_evals}.")
+            break
+
+        # Centroide de todos los puntos salvo el peor.
+        centroid = centroid_angles(simplex[:-1])
+
+        # ---------------------------------------------------------
+        # Reflexión
+        # ---------------------------------------------------------
+        worst_delta = angle_delta(worst_x, centroid)
+        reflected_x = project_angle_candidate(
+            centroid - alpha * worst_delta,
+            search_cfg,
+        )
+        reflected_x, reflected_info, reflected_score = eval_vertex(reflected_x)
+
+        # ---------------------------------------------------------
+        # Expansión: si la reflexión mejora al mejor actual.
+        # ---------------------------------------------------------
+        if reflected_score > best_score:
+            reflected_delta = angle_delta(reflected_x, centroid)
+            expanded_x = project_angle_candidate(
+                centroid + gamma * reflected_delta,
+                search_cfg,
+            )
+            expanded_x, expanded_info, expanded_score = eval_vertex(expanded_x)
+
+            if expanded_score > reflected_score:
+                simplex[-1] = expanded_x
+                scores_arr[-1] = expanded_score
+                infos[-1] = expanded_info
+            else:
+                simplex[-1] = reflected_x
+                scores_arr[-1] = reflected_score
+                infos[-1] = reflected_info
+
+        # ---------------------------------------------------------
+        # Aceptar reflexión si mejora al segundo peor.
+        # ---------------------------------------------------------
+        elif reflected_score > second_worst_score:
+            simplex[-1] = reflected_x
+            scores_arr[-1] = reflected_score
+            infos[-1] = reflected_info
+
+        # ---------------------------------------------------------
+        # Contracción o shrink.
+        # ---------------------------------------------------------
+        else:
+            if reflected_score > worst_score:
+                # Contracción externa: entre centroide y reflejado.
+                reflected_delta = angle_delta(reflected_x, centroid)
+                contracted_x = project_angle_candidate(
+                    centroid + rho * reflected_delta,
+                    search_cfg,
+                )
+                threshold_score = reflected_score
+            else:
+                # Contracción interna: entre centroide y peor.
+                contracted_x = project_angle_candidate(
+                    centroid + rho * worst_delta,
+                    search_cfg,
+                )
+                threshold_score = worst_score
+
+            contracted_x, contracted_info, contracted_score = eval_vertex(contracted_x)
+
+            if contracted_score > threshold_score:
+                simplex[-1] = contracted_x
+                scores_arr[-1] = contracted_score
+                infos[-1] = contracted_info
+            else:
+                # Shrink: encoger todo hacia el mejor punto.
+                best_x = simplex[0].copy()
+
+                new_simplex = [best_x]
+                new_scores = [scores_arr[0]]
+                new_infos = [infos[0]]
+
+                for j in range(1, len(simplex)):
+                    shrink_delta = angle_delta(simplex[j], best_x)
+                    shrunk_x = project_angle_candidate(
+                        best_x + sigma * shrink_delta,
+                        search_cfg,
                     )
-                    if info is None:
-                        continue
-                    fine_results.append(info)
+                    shrunk_x, shrunk_info, shrunk_score = eval_vertex(shrunk_x)
 
-    fine_results = sorted(fine_results, key=lambda d: float(d["score"]), reverse=True)
-    top_fine = fine_results[: search_cfg.topk_fine] if fine_results else top_coarse[: search_cfg.topk_fine]
+                    new_simplex.append(shrunk_x)
+                    new_scores.append(shrunk_score)
+                    new_infos.append(shrunk_info)
 
-    yaw_win_r, pitch_win_r, roll_win_r = search_cfg.refine_windows
-    yaw_step_r, pitch_step_r, roll_step_r = search_cfg.refine_steps
-    print("Comenzando refinamiento final...")
-    visited_refine = set()
-    for center in top_fine:
-        for yaw in frange(center["yaw"] - yaw_win_r, center["yaw"] + yaw_win_r, yaw_step_r):
-            for pitch in frange(center["pitch"] - pitch_win_r, center["pitch"] + pitch_win_r, pitch_step_r):
-                for roll in frange(center["roll"] - roll_win_r, center["roll"] + roll_win_r, roll_step_r):
-                    key = (round(float(yaw), 6), round(float(pitch), 6), round(float(roll), 6))
-                    if key in visited_refine:
-                        continue
-                    visited_refine.add(key)
-                    info = evaluate_candidate(
-                        yaw=yaw,
-                        pitch=pitch,
-                        roll=roll,
-                        real_image_path=real_image_path,
-                        real_image_bgr=real_bgr,
-                        render_ctx=render_ctx,
-                        matcher=matcher,
-                        matcher_cfg=matcher_cfg,
-                        warp_cfg=warp_cfg,
-                        device=device,
-                        metrics_cache=metrics_cache,
-                        metrics_jsonl=metrics_jsonl_path,
-                    )
-                    if info is None:
-                        continue
-                    refine_results.append(info)
+                simplex = np.vstack(new_simplex)
+                scores_arr = np.asarray(new_scores, dtype=np.float64)
+                infos = new_infos
 
-    all_valid = coarse_results + fine_results + refine_results
-    all_valid = sorted(all_valid, key=lambda d: float(d["score"]), reverse=True)
+    all_valid = sorted(
+        simplex_results,
+        key=lambda d: float(d["score"]),
+        reverse=True,
+    )
     best = all_valid[0] if all_valid else None
-    return best, (coarse_results, fine_results, refine_results)
+
+    print("Top simplex:")
+    for r in all_valid[:5]:
+        print(
+            f"  yaw={r['yaw']:.3f}, pitch={r['pitch']:.3f}, roll={r['roll']:.3f}, "
+            f"score={r['score']:.5f}, cv={r.get('cv_rmse', float('nan')):.5f}, "
+            f"disp={r.get('disp_rmse', float('nan')):.5f}, "
+            f"cov={r.get('coverage', float('nan')):.3f}, "
+            f"inliers={r.get('n_inliers', 0)}"
+        )
+
+    # Para mantener compatibilidad con el código anterior, devolvemos una tupla
+    # de tres listas. La primera contiene todos los candidatos válidos del simplex.
+    return best, (all_valid, [], [])
 
 
 # -------------------------------------------------------------------
 # API COMPATIBLE CON LA PIPELINE ACTUAL
 # -------------------------------------------------------------------
+
 
 def search_best_yaw_pitch_roll(
     real_image_path,
@@ -974,7 +1317,19 @@ def search_best_yaw_pitch_roll(
     orientation_mode="forward",
     earth_radius=10,
     metrics_jsonl=None,
+    simplex_max_iter=45,
+    simplex_max_evals=140,
+    simplex_score_tol=1e-3,
 ):
+    """
+    API principal: búsqueda de yaw, pitch y roll mediante Nelder-Mead/simplex.
+
+    Devuelve:
+        best, (simplex_results, [], [])
+
+    Se mantiene la forma de retorno de la versión coarse/fine/refine para no
+    romper código que espere tres listas.
+    """
     search_cfg = SearchConfig(
         yaw_range=tuple(map(float, yaw_range)),
         pitch_range=tuple(map(float, pitch_range)),
@@ -984,6 +1339,9 @@ def search_best_yaw_pitch_roll(
         fine_windows=tuple(map(float, fine_windows)),
         refine_steps=tuple(map(float, refine_steps)),
         refine_windows=tuple(map(float, refine_windows)),
+        simplex_max_iter=int(simplex_max_iter),
+        simplex_max_evals=int(simplex_max_evals),
+        simplex_score_tol=float(simplex_score_tol),
     )
     return search_best_orientation(
         real_image_path=real_image_path,
@@ -1001,6 +1359,71 @@ def search_best_yaw_pitch_roll(
         search_cfg=search_cfg,
         metrics_jsonl=metrics_jsonl,
     )
+
+
+def search_best_yaw_pitch(
+    real_image_path,
+    search_output_dir,
+    tle_dir,
+    texture_path,
+    obs_time,
+    focal_length,
+    sensor_width,
+    sensor_height,
+    pixel_width,
+    pixel_height,
+    yaw_range=(-180, 180),
+    pitch_range=(30, 90),
+    coarse_step=20,
+    fine_step=5,
+    fine_window=15,
+    roll=0,
+    orientation_mode="forward",
+    earth_radius=10,
+    metrics_jsonl=None,
+    simplex_max_iter=45,
+    simplex_max_evals=140,
+    simplex_score_tol=1e-3,
+):
+    """
+    Wrapper compatible con la pipeline antigua, que buscaba solo yaw/pitch
+    manteniendo roll fijo.
+
+    Internamente llama a search_best_yaw_pitch_roll con roll_range=(roll, roll).
+
+    Devuelve:
+        best, (simplex_results, [])
+
+    Así sigue funcionando código del tipo:
+        best_angles, (coarse_res, fine_res) = angle_search.search_best_yaw_pitch(...)
+    """
+    best, (simplex_results, _, _) = search_best_yaw_pitch_roll(
+        real_image_path=real_image_path,
+        search_output_dir=search_output_dir,
+        tle_dir=tle_dir,
+        texture_path=texture_path,
+        obs_time=obs_time,
+        focal_length=focal_length,
+        sensor_width=sensor_width,
+        sensor_height=sensor_height,
+        pixel_width=pixel_width,
+        pixel_height=pixel_height,
+        yaw_range=yaw_range,
+        pitch_range=pitch_range,
+        roll_range=(float(roll), float(roll)),
+        coarse_steps=(float(coarse_step), float(coarse_step), 1.0),
+        fine_steps=(float(fine_step), float(fine_step), 0.5),
+        fine_windows=(float(fine_window), float(fine_window), 0.0),
+        refine_steps=(float(fine_step), float(fine_step), 0.5),
+        refine_windows=(float(fine_window), float(fine_window), 0.0),
+        orientation_mode=orientation_mode,
+        earth_radius=earth_radius,
+        metrics_jsonl=metrics_jsonl,
+        simplex_max_iter=simplex_max_iter,
+        simplex_max_evals=simplex_max_evals,
+        simplex_score_tol=simplex_score_tol,
+    )
+    return best, (simplex_results, [])
 
 
 # -------------------------------------------------------------------
@@ -1039,6 +1462,9 @@ if __name__ == "__main__":
     parser.add_argument("--fine_roll_step", type=float, default=1)
     parser.add_argument("--orientation_mode", choices=["north", "forward"], default="forward")
     parser.add_argument("--metrics_jsonl", default=None)
+    parser.add_argument("--simplex_max_iter", type=int, default=45)
+    parser.add_argument("--simplex_max_evals", type=int, default=140)
+    parser.add_argument("--simplex_score_tol", type=float, default=1e-3)
     args = parser.parse_args()
 
     obs_time = datetime.fromisoformat(args.obs_time)
@@ -1063,6 +1489,9 @@ if __name__ == "__main__":
         fine_steps=(args.fine_yaw_step, args.fine_pitch_step, args.fine_roll_step),
         orientation_mode=args.orientation_mode,
         metrics_jsonl=args.metrics_jsonl,
+        simplex_max_iter=args.simplex_max_iter,
+        simplex_max_evals=args.simplex_max_evals,
+        simplex_score_tol=args.simplex_score_tol,
     )
 
     print("\nMejor orientación encontrada:")
