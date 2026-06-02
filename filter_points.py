@@ -1,76 +1,62 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Filtrado espacial + coherencia temporal de archivos .points de un timelapse ISS.
+Temporal/spatial filtering of ISS timelapse Ground Control Points (.points).
 
-Esta versión sustituye/amplía el antiguo filter_points.py:
+Run this after project_timelapse.py and before georef_timelapse.py.
 
-1) Lee los .points generados por project_timelapse.py, normalmente *_real.points.
-2) Identifica cada trayectoria temporal por el punto de la rejilla real:
-       track_id = (sourceX, sourceY)
-   Es decir, el mismo punto de la imagen real a través de todos los frames.
-3) Marca como inválidos los puntos geográficamente aislados dentro de cada frame
-   usando BallTree/haversine, igual que el filtro anterior.
-4) Para cada track_id ajusta polinomios robustos lat(t), lon(t):
-       mapY = latitud
-       mapX = longitud
-   y detecta observaciones temporalmente incoherentes por residuo geodésico.
-5) Imputa los outliers y pequeños huecos mediante el polinomio temporal.
-6) Opcionalmente vuelve a aplicar el filtro espacial final.
-7) Guarda .points listos para georef_timelapse.py con nombres:
-       <mission>-E-<ID>.points
-8) Guarda CSVs de control de calidad y plots opcionales.
+Each control point is identified by its fixed source image grid coordinate:
 
-Uso recomendado en la pipeline, después de project_timelapse.py:
+    track_id = (sourceX, sourceY)
 
-    python -m scripts_v3.filter_points \
-        --input_folder ISS030-E-281044-281946/output \
-        --output_folder ISS030-E-281044-281946/filtered_points \
-        --radius_km 40 \
-        --start_id 281044 \
-        --end_id 281946 \
-        --mission ISS030 \
-        --temporal_order 3 \
-        --temporal_outlier_km 80 \
-        --max_gap_frames 8 \
-        --plot_dir ISS030-E-281044-281946/temporal_qc_plots
+For each track, the geographic coordinates mapX/mapY should evolve smoothly
+through the timelapse. This script:
 
-Si quieres reproducir el comportamiento antiguo casi exactamente:
+1. loads all *_real.points files;
+2. groups observations by sourceX/sourceY;
+3. fits smooth polynomial trajectories in lon/lat;
+4. detects temporal outliers statistically from the residual distribution;
+5. replaces temporal outliers by the fitted trajectory when the track has
+   enough support;
+6. optionally fills short missing gaps;
+7. applies a final spatial BallTree filter;
+8. writes filtered .points files named <mission>-E-<ID>.points;
+9. writes QC tables and plots.
 
-    python -m scripts_v3.filter_points ... --disable_temporal --no_pre_spatial_filter
-
-Notas importantes:
-- No se usa el índice de fila para emparejar puntos, sino sourceX/sourceY.
-  Esto evita descuadres cuando un frame pierde algunos puntos.
-- La longitud se ajusta con unwrap angular para evitar saltos en ±180 grados.
-- Por defecto se imputan outliers y huecos interiores cortos. No se extrapolan
-  huecos al principio/final de una trayectoria salvo que uses --allow_extrapolation.
+Overlay plot colors:
+    blue   = untouched points kept in final .points
+    green  = temporal outlier/imputed points kept in final .points
+    orange = temporal outlier/imputed points removed by final spatial filter
+    red    = untouched points removed by final spatial filter
+    yellow star = diagnostic tracks
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import os
 import re
-from collections import defaultdict
+import warnings
 from dataclasses import dataclass
 from glob import glob
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
-from sklearn.neighbors import BallTree
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import patheffects as pe
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageOps
+from sklearn.neighbors import BallTree
 
 
 EARTH_RADIUS_KM = 6371.0088
 REQUIRED_COLUMNS = {"mapX", "mapY", "sourceX", "sourceY"}
-DEFAULT_OUTPUT_COLUMNS = ["mapX", "mapY", "sourceX", "sourceY", "enable", "dX", "dY", "residual"]
+BASE_OUTPUT_COLUMNS = [
+    "mapX", "mapY", "sourceX", "sourceY", "enable", "dX", "dY", "residual",
+]
 
 
 @dataclass
@@ -84,9 +70,9 @@ class FrameInfo:
     pre_spatial_kept: int = 0
     output_before_post_spatial: int = 0
     post_spatial_kept: int = 0
-    n_imputed: int = 0
     n_temporal_outliers: int = 0
-    n_pre_spatial_rejected_used_as_missing: int = 0
+    n_imputed: int = 0
+    n_post_spatial_rejected: int = 0
 
 
 @dataclass
@@ -94,31 +80,34 @@ class TrackResult:
     key: str
     sourceX: float
     sourceY: float
-    observed: np.ndarray
-    finite: np.ndarray
-    pre_spatial_ok: np.ndarray
-    temporal_good: np.ndarray
-    temporal_outlier: np.ndarray
-    imputed: np.ndarray
-    output_present: np.ndarray
     raw_lon: np.ndarray
     raw_lat: np.ndarray
     pred_lon: np.ndarray
     pred_lat: np.ndarray
+    observed: np.ndarray
+    finite: np.ndarray
+    pre_spatial_ok: np.ndarray
+    fit_used: np.ndarray
+    temporal_outlier: np.ndarray
+    imputed: np.ndarray
+    output_present: np.ndarray
     residual_km: np.ndarray
     threshold_km: float
+    residual_mean_km: float
+    residual_std_km: float
     degree: int
     rmse_km: float
     max_residual_km: float
+    can_impute: bool
+
+
+# -----------------------------------------------------------------------------
+# Basic helpers
+# -----------------------------------------------------------------------------
 
 
 def extract_id_from_point_filename(name: str) -> Optional[int]:
-    """
-    Extrae el ID real desde nombres como:
-      ISS067-E-327041_real.points
-      ISS067-E-327041.points
-      coordinates_... -> None
-    """
+    """Extract image ID from names such as ISS067-E-327041_real.points."""
     m = re.search(r"[A-Za-z0-9]+-E-(\d+)", name)
     if m:
         return int(m.group(1))
@@ -126,10 +115,6 @@ def extract_id_from_point_filename(name: str) -> Optional[int]:
 
 
 def make_source_key(source_x: Any, source_y: Any, decimals: int) -> str:
-    """
-    Clave estable para identificar el mismo punto de la rejilla real.
-    Se redondea para evitar ruido flotante mínimo.
-    """
     sx = round(float(source_x), decimals)
     sy = round(float(source_y), decimals)
     return f"{sx:.{decimals}f}|{sy:.{decimals}f}"
@@ -141,8 +126,11 @@ def parse_source_key(key: str) -> Tuple[float, float]:
 
 
 def wrap_lon_deg(lon: np.ndarray | float) -> np.ndarray | float:
-    """Envuelve longitud a [-180, 180)."""
-    return (np.asarray(lon) + 180.0) % 360.0 - 180.0
+    arr = np.asarray(lon, dtype=float)
+    out = (arr + 180.0) % 360.0 - 180.0
+    if np.isscalar(lon):
+        return float(out)
+    return out
 
 
 def haversine_km(
@@ -151,57 +139,16 @@ def haversine_km(
     lat2_deg: np.ndarray,
     lon2_deg: np.ndarray,
 ) -> np.ndarray:
-    """Distancia geodésica aproximada sobre esfera, vectorizada."""
-    lat1 = np.radians(lat1_deg.astype(float))
-    lat2 = np.radians(lat2_deg.astype(float))
-    lon1 = np.radians(lon1_deg.astype(float))
-    lon2 = np.radians(lon2_deg.astype(float))
+    lat1 = np.radians(np.asarray(lat1_deg, dtype=float))
+    lat2 = np.radians(np.asarray(lat2_deg, dtype=float))
+    lon1 = np.radians(np.asarray(lon1_deg, dtype=float))
+    lon2 = np.radians(np.asarray(lon2_deg, dtype=float))
 
     dlat = lat2 - lat1
     dlon = (lon2 - lon1 + np.pi) % (2.0 * np.pi) - np.pi
     a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
     a = np.clip(a, 0.0, 1.0)
-    c = 2.0 * np.arcsin(np.sqrt(a))
-    return EARTH_RADIUS_KM * c
-
-
-def spatial_neighbor_mask(df: pd.DataFrame, radius_km: float) -> np.ndarray:
-    """
-    Devuelve True para puntos que tienen al menos otro vecino dentro de radius_km.
-    Reproduce el criterio del filter_points.py original, pero tolera NaNs.
-    """
-    mask = np.zeros(len(df), dtype=bool)
-    if len(df) == 0:
-        return mask
-
-    required = ["mapY", "mapX"]
-    if not set(required).issubset(df.columns):
-        return mask
-
-    coords_deg = df[required].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-    finite = np.isfinite(coords_deg).all(axis=1)
-    finite_idx = np.where(finite)[0]
-
-    if len(finite_idx) < 2:
-        return mask
-
-    coords_rad = np.radians(coords_deg[finite_idx])
-    radius_rad = float(radius_km) / EARTH_RADIUS_KM
-    tree = BallTree(coords_rad, metric="haversine")
-    neighbors = tree.query_radius(coords_rad, r=radius_rad)
-    keep_finite = np.array([len(n) > 1 for n in neighbors], dtype=bool)
-    mask[finite_idx] = keep_finite
-    return mask
-
-
-def list_point_files(input_folder: Path, input_glob: str) -> List[Path]:
-    files = sorted(Path(p) for p in glob(str(input_folder / input_glob)))
-    return files
-
-
-def read_points_file(path: Path) -> pd.DataFrame:
-    """Lee .points tolerando líneas de metadatos QGIS que empiecen por M."""
-    return pd.read_csv(path, comment="M")
+    return EARTH_RADIUS_KM * (2.0 * np.arcsin(np.sqrt(a)))
 
 
 def coerce_numeric_columns(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
@@ -212,20 +159,50 @@ def coerce_numeric_columns(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFram
     return out
 
 
-def discover_output_columns(input_columns: List[str], add_qc_columns: bool) -> List[str]:
-    """
-    Mantiene las columnas de entrada si existen y añade las típicas de QGIS si faltan.
-    Por defecto no añade columnas QC para no romper lectores externos estrictos.
-    """
-    cols = list(input_columns)
-    for c in DEFAULT_OUTPUT_COLUMNS:
-        if c not in cols:
-            cols.append(c)
+def read_points_file(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path, comment="M")
+
+
+def spatial_neighbor_mask(df: pd.DataFrame, radius_km: float) -> np.ndarray:
+    """True if a point has at least one other neighbour within radius_km."""
+    mask = np.zeros(len(df), dtype=bool)
+    if len(df) < 2 or not {"mapY", "mapX"}.issubset(df.columns):
+        return mask
+
+    coords_deg = df[["mapY", "mapX"]].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+    finite = np.isfinite(coords_deg).all(axis=1)
+    finite_idx = np.where(finite)[0]
+    if len(finite_idx) < 2:
+        return mask
+
+    coords_rad = np.radians(coords_deg[finite_idx])
+    radius_rad = float(radius_km) / EARTH_RADIUS_KM
+    tree = BallTree(coords_rad, metric="haversine")
+    neighbours = tree.query_radius(coords_rad, r=radius_rad)
+    mask[finite_idx] = np.array([len(n) > 1 for n in neighbours], dtype=bool)
+    return mask
+
+
+def discover_output_columns(first_input_columns: Sequence[str], add_qc_columns: bool) -> List[str]:
+    if first_input_columns and REQUIRED_COLUMNS.issubset(set(first_input_columns)):
+        cols = [c for c in first_input_columns if not str(c).startswith("__")]
+    else:
+        cols = BASE_OUTPUT_COLUMNS.copy()
+
+    for col in BASE_OUTPUT_COLUMNS:
+        if col not in cols:
+            cols.append(col)
+
     if add_qc_columns:
-        for c in ["temporal_status", "temporal_residual_km"]:
-            if c not in cols:
-                cols.append(c)
+        for col in ["temporal_status", "temporal_residual_km", "temporal_threshold_km"]:
+            if col not in cols:
+                cols.append(col)
     return cols
+
+
+# -----------------------------------------------------------------------------
+# Loading
+# -----------------------------------------------------------------------------
 
 
 def load_timelapse_points(
@@ -236,511 +213,491 @@ def load_timelapse_points(
     input_glob: str,
     source_round_decimals: int,
     radius_km: float,
-    pre_spatial_filter: bool,
 ) -> Tuple[List[FrameInfo], pd.DataFrame, List[str]]:
-    """
-    Carga todos los .points y construye una tabla larga con columnas auxiliares.
-    """
     input_dir = Path(input_folder)
-    point_files = list_point_files(input_dir, input_glob)
+    point_files = sorted(Path(p) for p in glob(str(input_dir / input_glob)))
 
     expected_count = end_id - start_id + 1
     if len(point_files) != expected_count:
         print(
-            f"⚠️ Aviso: se esperaban {expected_count} archivos '{input_glob}', "
-            f"pero se encontraron {len(point_files)} en '{input_folder}'."
+            f"WARNING: expected {expected_count} files matching '{input_glob}', "
+            f"found {len(point_files)} in '{input_folder}'."
         )
-        print("   Se continuará usando los archivos ordenados por nombre y los IDs parseados si existen.\n")
+        print("Continuing with sorted files and parsed IDs when possible.\n")
 
     frames: List[FrameInfo] = []
-    all_rows: List[pd.DataFrame] = []
+    rows: List[pd.DataFrame] = []
     first_input_columns: List[str] = []
 
-    for sorted_idx, file_path in enumerate(point_files):
-        parsed_id = extract_id_from_point_filename(file_path.name)
-        current_id = parsed_id if parsed_id is not None else start_id + sorted_idx
+    for sorted_idx, path in enumerate(point_files):
+        parsed_id = extract_id_from_point_filename(path.name)
+        frame_id = parsed_id if parsed_id is not None else start_id + sorted_idx
 
-        if current_id < start_id or current_id > end_id:
-            print(f"⚠️ {file_path.name}: ID {current_id} fuera de rango, se salta.")
+        if frame_id < start_id or frame_id > end_id:
+            print(f"WARNING: {path.name}: ID {frame_id} out of range, skipped.")
             continue
 
         frame_index = len(frames)
-        output_name = f"{mission}-E-{current_id}.points"
         info = FrameInfo(
             frame_index=frame_index,
-            frame_id=current_id,
-            input_path=file_path,
-            input_name=file_path.name,
-            output_name=output_name,
+            frame_id=frame_id,
+            input_path=path,
+            input_name=path.name,
+            output_name=f"{mission}-E-{frame_id}.points",
         )
 
         try:
-            df = read_points_file(file_path)
-        except Exception as e:
-            print(f"❌ Error leyendo {file_path}: {e}")
+            df = read_points_file(path)
+        except Exception as exc:
+            print(f"ERROR reading {path}: {exc}")
+            continue
+
+        if not REQUIRED_COLUMNS.issubset(df.columns):
+            print(f"WARNING: {path.name} lacks columns {sorted(REQUIRED_COLUMNS)}, skipped.")
             continue
 
         if not first_input_columns:
             first_input_columns = list(df.columns)
 
-        missing = REQUIRED_COLUMNS - set(df.columns)
-        if missing:
-            print(f"⚠️ {file_path.name}: faltan columnas {sorted(missing)}, se salta.")
-            continue
-
         df = coerce_numeric_columns(df, REQUIRED_COLUMNS | {"enable", "dX", "dY", "residual"})
         info.input_count = len(df)
 
-        if len(df) == 0:
-            info.pre_spatial_kept = 0
-            frames.append(info)
-            continue
+        finite_geo = np.isfinite(df[["mapX", "mapY", "sourceX", "sourceY"]].to_numpy(dtype=float)).all(axis=1)
 
-        df["_source_key"] = [
+        # Diagnostic only unless --pre_spatial_filter is explicitly used.
+        pre_spatial = spatial_neighbor_mask(df, radius_km=radius_km)
+        info.pre_spatial_kept = int(pre_spatial.sum())
+
+        df = df.copy()
+        df["__frame_index"] = frame_index
+        df["__frame_id"] = frame_id
+        df["__row_index"] = np.arange(len(df), dtype=int)
+        df["__finite_geo"] = finite_geo
+        df["__pre_spatial_ok"] = pre_spatial
+        df["__source_key"] = [
             make_source_key(x, y, source_round_decimals)
+            if np.isfinite(x) and np.isfinite(y) else "nan|nan"
             for x, y in zip(df["sourceX"], df["sourceY"])
         ]
 
-        n_before_dup = len(df)
-        df = df.drop_duplicates(subset=["_source_key"], keep="first").copy()
-        if len(df) != n_before_dup:
-            print(
-                f"⚠️ {file_path.name}: {n_before_dup - len(df)} puntos duplicados por sourceX/sourceY; "
-                "se conserva el primero."
-            )
-
-        if pre_spatial_filter:
-            pre_mask = spatial_neighbor_mask(df, radius_km=radius_km)
-        else:
-            coords = df[["mapY", "mapX"]].to_numpy(dtype=float)
-            pre_mask = np.isfinite(coords).all(axis=1)
-
-        df["_pre_spatial_ok"] = pre_mask.astype(bool)
-        info.pre_spatial_kept = int(pre_mask.sum())
-
-        df["_frame_index"] = frame_index
-        df["_frame_id"] = current_id
-        df["_input_name"] = file_path.name
-        df["_row_index"] = np.arange(len(df), dtype=int)
-
-        all_rows.append(df)
         frames.append(info)
+        rows.append(df)
 
-    if not frames:
-        raise RuntimeError(f"No se pudo cargar ningún archivo .points válido desde {input_folder}")
+    if not rows:
+        return frames, pd.DataFrame(), first_input_columns
 
-    if all_rows:
-        long_df = pd.concat(all_rows, ignore_index=True)
-    else:
-        long_df = pd.DataFrame()
-
-    return frames, long_df, first_input_columns
+    all_df = pd.concat(rows, ignore_index=True)
+    all_df = all_df[all_df["__source_key"] != "nan|nan"].copy()
+    return frames, all_df, first_input_columns
 
 
-def fit_poly(t: np.ndarray, y: np.ndarray, valid: np.ndarray, order: int) -> Tuple[np.ndarray, np.ndarray, int]:
-    """Ajusta un polinomio y predice en todos los t."""
-    n = int(valid.sum())
-    if n < 2:
-        raise ValueError("No hay suficientes puntos para ajustar polinomio")
-    degree = int(min(max(order, 1), n - 1))
-    coeffs = np.polyfit(t[valid], y[valid], deg=degree)
-    pred = np.polyval(coeffs, t)
-    return pred, coeffs, degree
+# -----------------------------------------------------------------------------
+# Temporal fitting
+# -----------------------------------------------------------------------------
 
 
-def can_fill_frame(
-    i: int,
-    good_mask: np.ndarray,
-    max_gap_frames: int,
-    allow_extrapolation: bool,
-) -> bool:
-    """
-    Decide si se puede imputar el frame i.
-    Por defecto solo interpola huecos interiores; no extrapola extremos.
-    """
-    if allow_extrapolation:
-        return bool(good_mask.any())
-
-    good_idx = np.where(good_mask)[0]
-    if len(good_idx) < 2:
-        return False
-
-    prev = good_idx[good_idx < i]
-    nxt = good_idx[good_idx > i]
-    if len(prev) == 0 or len(nxt) == 0:
-        return False
-
-    p = int(prev[-1])
-    n = int(nxt[0])
-    gap_len = n - p - 1
-    if max_gap_frames < 0:
-        return True
-    return gap_len <= max_gap_frames
+def normalized_time(n_frames: int) -> np.ndarray:
+    t = np.arange(n_frames, dtype=float)
+    if n_frames <= 1:
+        return np.zeros(n_frames, dtype=float)
+    center = 0.5 * (n_frames - 1)
+    scale = max(center, 1.0)
+    return (t - center) / scale
 
 
-def robust_temporal_fit_track(
-    track: pd.DataFrame,
-    n_frames: int,
-    t_norm: np.ndarray,
-    temporal_order: int,
-    temporal_outlier_km: float,
+def safe_polyfit_eval(x: np.ndarray, y: np.ndarray, x_all: np.ndarray, degree: int) -> Optional[np.ndarray]:
+    if len(x) <= degree:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            coeff = np.polyfit(x, y, deg=degree)
+        return np.polyval(coeff, x_all)
+    except Exception:
+        return None
+
+
+def residual_threshold_km(
+    residuals: np.ndarray,
+    mode: str,
     temporal_sigma: float,
-    temporal_min_scale_km: float,
-    temporal_max_iter: int,
+    temporal_outlier_km: float,
+    min_threshold_km: float,
+) -> Tuple[float, float, float]:
+    vals = residuals[np.isfinite(residuals)]
+    if len(vals) == 0:
+        return float("inf"), float("nan"), float("nan")
+
+    mean = float(np.mean(vals))
+    std = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+    if not np.isfinite(std):
+        std = 0.0
+
+    sigma_thr = mean + float(temporal_sigma) * std
+
+    if mode == "sigma":
+        thr = sigma_thr
+    elif mode == "hybrid":
+        thr = max(float(temporal_outlier_km), sigma_thr)
+    elif mode == "absolute":
+        thr = float(temporal_outlier_km)
+    else:
+        raise ValueError(f"Unknown threshold mode: {mode}")
+
+    if np.isfinite(min_threshold_km) and min_threshold_km > 0:
+        thr = max(float(min_threshold_km), float(thr))
+
+    return float(thr), mean, std
+
+
+def fit_predict_track(
+    raw_lon: np.ndarray,
+    raw_lat: np.ndarray,
+    initial_fit_mask: np.ndarray,
+    n_frames: int,
+    order: int,
     min_track_points: int,
-    max_gap_frames: int,
-    allow_extrapolation: bool,
-    fill_missing: bool,
-) -> TrackResult:
-    """
-    Ajusta trayectoria lat/lon para un único sourceX/sourceY.
-    """
-    key = str(track["_source_key"].iloc[0])
-    sourceX, sourceY = parse_source_key(key)
-
-    raw_lon = np.full(n_frames, np.nan, dtype=float)
-    raw_lat = np.full(n_frames, np.nan, dtype=float)
-    observed = np.zeros(n_frames, dtype=bool)
-    pre_spatial_ok = np.zeros(n_frames, dtype=bool)
-
-    # Si hay duplicados residuales por seguridad, nos quedamos con el primero por frame.
-    track2 = track.sort_values(["_frame_index", "_row_index"]).drop_duplicates("_frame_index", keep="first")
-
-    frame_indices = track2["_frame_index"].to_numpy(dtype=int)
-    raw_lon[frame_indices] = track2["mapX"].to_numpy(dtype=float)
-    raw_lat[frame_indices] = track2["mapY"].to_numpy(dtype=float)
-    observed[frame_indices] = True
-    pre_spatial_ok[frame_indices] = track2["_pre_spatial_ok"].to_numpy(dtype=bool)
-
-    finite = observed & np.isfinite(raw_lon) & np.isfinite(raw_lat)
-    initial_valid = finite & pre_spatial_ok
-
+    threshold_mode: str,
+    temporal_sigma: float,
+    temporal_outlier_km: float,
+    temporal_min_threshold_km: float,
+    temporal_max_iter: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float, int, float, float]:
     pred_lon = np.full(n_frames, np.nan, dtype=float)
     pred_lat = np.full(n_frames, np.nan, dtype=float)
-    residual_km = np.full(n_frames, np.nan, dtype=float)
-    temporal_good = initial_valid.copy()
-    temporal_outlier = np.zeros(n_frames, dtype=bool)
-    imputed = np.zeros(n_frames, dtype=bool)
-    output_present = np.zeros(n_frames, dtype=bool)
-    threshold_km = float("nan")
-    degree = -1
-    rmse_km = float("nan")
-    max_residual_km = float("nan")
+    residual = np.full(n_frames, np.nan, dtype=float)
+    fit_used = np.zeros(n_frames, dtype=bool)
 
-    if int(initial_valid.sum()) < max(2, min_track_points):
-        # Sin ajuste fiable. Se conservan solo observaciones válidas por filtro espacial.
-        output_present = initial_valid.copy()
-        return TrackResult(
-            key=key,
-            sourceX=sourceX,
-            sourceY=sourceY,
-            observed=observed,
-            finite=finite,
-            pre_spatial_ok=pre_spatial_ok,
-            temporal_good=temporal_good,
-            temporal_outlier=temporal_outlier,
-            imputed=imputed,
-            output_present=output_present,
+    current_mask = initial_fit_mask.copy()
+    if current_mask.sum() < min_track_points:
+        return pred_lon, pred_lat, fit_used, residual, float("nan"), float("nan"), float("nan"), -1, np.nan, np.nan
+
+    x_all = normalized_time(n_frames)
+    last_mask: Optional[np.ndarray] = None
+    threshold = float("nan")
+    res_mean = float("nan")
+    res_std = float("nan")
+    degree = -1
+
+    max_iter = max(1, int(temporal_max_iter))
+    for _ in range(max_iter):
+        idx = np.where(current_mask)[0]
+        if len(idx) < min_track_points:
+            break
+
+        degree = int(min(order, len(idx) - 1))
+        if degree < 1:
+            break
+
+        x_fit = x_all[idx]
+        lon_fit_unwrapped = np.degrees(np.unwrap(np.radians(raw_lon[idx].astype(float))))
+        lat_fit = raw_lat[idx].astype(float)
+
+        pred_lon_unwrapped = safe_polyfit_eval(x_fit, lon_fit_unwrapped, x_all, degree)
+        pred_lat_all = safe_polyfit_eval(x_fit, lat_fit, x_all, degree)
+        if pred_lon_unwrapped is None or pred_lat_all is None:
+            break
+
+        pred_lon_all = wrap_lon_deg(pred_lon_unwrapped).astype(float)
+        pred_lat_all = pred_lat_all.astype(float)
+
+        observed = np.isfinite(raw_lon) & np.isfinite(raw_lat)
+        residual[:] = np.nan
+        residual[observed] = haversine_km(
+            raw_lat[observed], raw_lon[observed], pred_lat_all[observed], pred_lon_all[observed]
+        )
+
+        threshold, res_mean, res_std = residual_threshold_km(
+            residual[current_mask],
+            mode=threshold_mode,
+            temporal_sigma=temporal_sigma,
+            temporal_outlier_km=temporal_outlier_km,
+            min_threshold_km=temporal_min_threshold_km,
+        )
+
+        new_mask = initial_fit_mask & np.isfinite(residual) & (residual <= threshold)
+
+        if new_mask.sum() < min_track_points:
+            pred_lon = pred_lon_all
+            pred_lat = pred_lat_all
+            fit_used = current_mask.copy()
+            break
+
+        pred_lon = pred_lon_all
+        pred_lat = pred_lat_all
+        fit_used = new_mask.copy()
+
+        if last_mask is not None and np.array_equal(new_mask, last_mask):
+            break
+        if np.array_equal(new_mask, current_mask):
+            break
+
+        last_mask = current_mask.copy()
+        current_mask = new_mask
+
+    if fit_used.any():
+        rmse = float(np.sqrt(np.nanmean(residual[fit_used] ** 2)))
+    else:
+        rmse = np.nan
+
+    max_res = float(np.nanmax(residual)) if np.isfinite(residual).any() else np.nan
+    return pred_lon, pred_lat, fit_used, residual, threshold, res_mean, res_std, degree, rmse, max_res
+
+
+def bounded_gap_fill_mask(
+    candidate_missing: np.ndarray,
+    valid_anchor: np.ndarray,
+    max_gap_frames: int,
+    allow_extrapolation: bool,
+) -> np.ndarray:
+    n = len(candidate_missing)
+    fill = np.zeros(n, dtype=bool)
+    i = 0
+    while i < n:
+        if not candidate_missing[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and candidate_missing[j]:
+            j += 1
+
+        gap_len = j - i
+        length_ok = (max_gap_frames < 0) or (gap_len <= max_gap_frames)
+        left_ok = i > 0 and valid_anchor[i - 1]
+        right_ok = j < n and valid_anchor[j]
+        interior = left_ok and right_ok
+        edge_allowed = allow_extrapolation and (left_ok or right_ok)
+
+        if length_ok and (interior or edge_allowed):
+            fill[i:j] = True
+        i = j
+    return fill
+
+
+def build_track_results(
+    all_df: pd.DataFrame,
+    frames: List[FrameInfo],
+    temporal_order: int,
+    threshold_mode: str,
+    temporal_outlier_km: float,
+    temporal_sigma: float,
+    temporal_min_threshold_km: float,
+    temporal_max_iter: int,
+    min_track_points: int,
+    min_track_coverage: float,
+    max_gap_frames: int,
+    fill_missing: bool,
+    allow_extrapolation: bool,
+    use_pre_spatial_for_fit: bool,
+    disable_temporal: bool,
+) -> Dict[str, TrackResult]:
+    n_frames = len(frames)
+    results: Dict[str, TrackResult] = {}
+
+    for key, g in all_df.groupby("__source_key", sort=True):
+        sx, sy = parse_source_key(key)
+        raw_lon = np.full(n_frames, np.nan, dtype=float)
+        raw_lat = np.full(n_frames, np.nan, dtype=float)
+        observed = np.zeros(n_frames, dtype=bool)
+        finite = np.zeros(n_frames, dtype=bool)
+        pre_ok = np.zeros(n_frames, dtype=bool)
+
+        for frame_index, gf in g.sort_values("__row_index").groupby("__frame_index", sort=True):
+            fi = int(frame_index)
+            if not (0 <= fi < n_frames):
+                continue
+            gf_valid = gf[gf["__finite_geo"].astype(bool)]
+            row = gf_valid.iloc[0] if len(gf_valid) else gf.iloc[0]
+            finite[fi] = bool(row["__finite_geo"])
+            observed[fi] = finite[fi]
+            pre_ok[fi] = bool(row["__pre_spatial_ok"])
+            if finite[fi]:
+                raw_lon[fi] = float(row["mapX"])
+                raw_lat[fi] = float(row["mapY"])
+
+        if disable_temporal:
+            pred_lon = raw_lon.copy()
+            pred_lat = raw_lat.copy()
+            residual = np.full(n_frames, np.nan, dtype=float)
+            fit_used = finite.copy()
+            temporal_outlier = np.zeros(n_frames, dtype=bool)
+            imputed = np.zeros(n_frames, dtype=bool)
+            output_present = finite.copy()
+            results[key] = TrackResult(
+                key=key, sourceX=sx, sourceY=sy,
+                raw_lon=raw_lon, raw_lat=raw_lat,
+                pred_lon=pred_lon, pred_lat=pred_lat,
+                observed=observed, finite=finite, pre_spatial_ok=pre_ok,
+                fit_used=fit_used, temporal_outlier=temporal_outlier,
+                imputed=imputed, output_present=output_present,
+                residual_km=residual, threshold_km=np.nan,
+                residual_mean_km=np.nan, residual_std_km=np.nan,
+                degree=-1, rmse_km=np.nan, max_residual_km=np.nan,
+                can_impute=False,
+            )
+            continue
+
+        fit_mask = finite.copy()
+        if use_pre_spatial_for_fit:
+            fit_mask &= pre_ok
+
+        (
+            pred_lon, pred_lat, fit_used, residual, threshold, res_mean, res_std,
+            degree, rmse, max_res,
+        ) = fit_predict_track(
             raw_lon=raw_lon,
             raw_lat=raw_lat,
-            pred_lon=pred_lon,
-            pred_lat=pred_lat,
-            residual_km=residual_km,
-            threshold_km=threshold_km,
-            degree=degree,
-            rmse_km=rmse_km,
-            max_residual_km=max_residual_km,
+            initial_fit_mask=fit_mask,
+            n_frames=n_frames,
+            order=temporal_order,
+            min_track_points=min_track_points,
+            threshold_mode=threshold_mode,
+            temporal_sigma=temporal_sigma,
+            temporal_outlier_km=temporal_outlier_km,
+            temporal_min_threshold_km=temporal_min_threshold_km,
+            temporal_max_iter=temporal_max_iter,
         )
 
-    # Preparar longitud sin discontinuidades en los frames observados.
-    lon_unwrapped = np.full(n_frames, np.nan, dtype=float)
-    obs_idx = np.where(finite)[0]
-    if len(obs_idx) > 0:
-        lon_unwrapped[obs_idx] = np.degrees(np.unwrap(np.radians(raw_lon[obs_idx])))
+        can_fit = degree >= 1 and np.isfinite(pred_lon).any() and np.isfinite(pred_lat).any()
+        coverage = float(finite.sum()) / max(n_frames, 1)
+        can_impute = bool(can_fit and fit_used.sum() >= min_track_points and coverage >= min_track_coverage)
 
-    valid = initial_valid.copy()
-    last_valid = None
+        temporal_outlier = finite & np.isfinite(residual) & np.isfinite(threshold) & (residual > threshold)
+        temporal_good = fit_used.copy()
+        output_present = temporal_good.copy()
+        imputed = np.zeros(n_frames, dtype=bool)
 
-    for _ in range(max(1, temporal_max_iter)):
-        if int(valid.sum()) < max(2, min_track_points):
-            break
+        if can_impute:
+            # Observed temporal outliers are bad observations. They are always
+            # replaced by the fitted trajectory when the track has enough support.
+            # max_gap_frames / allow_extrapolation is reserved for truly missing
+            # frames, not for observed outliers.
+            outlier_fill = temporal_outlier.copy()
 
-        try:
-            pred_lat_i, _, degree_lat = fit_poly(t_norm, raw_lat, valid, temporal_order)
-            pred_lon_unw_i, _, degree_lon = fit_poly(t_norm, lon_unwrapped, valid, temporal_order)
-        except Exception:
-            break
+            missing_fill = np.zeros(n_frames, dtype=bool)
+            if fill_missing:
+                missing_fill = bounded_gap_fill_mask(
+                    candidate_missing=~finite,
+                    valid_anchor=temporal_good,
+                    max_gap_frames=max_gap_frames,
+                    allow_extrapolation=allow_extrapolation,
+                )
 
-        pred_lon_i = wrap_lon_deg(pred_lon_unw_i).astype(float)
-        residual_i = np.full(n_frames, np.nan, dtype=float)
-        residual_i[finite] = haversine_km(
-            raw_lat[finite], raw_lon[finite], pred_lat_i[finite], pred_lon_i[finite]
+            fill_mask = outlier_fill | missing_fill
+            output_present[fill_mask] = True
+            imputed[fill_mask] = True
+
+        results[key] = TrackResult(
+            key=key, sourceX=sx, sourceY=sy,
+            raw_lon=raw_lon, raw_lat=raw_lat,
+            pred_lon=pred_lon, pred_lat=pred_lat,
+            observed=observed, finite=finite, pre_spatial_ok=pre_ok,
+            fit_used=fit_used, temporal_outlier=temporal_outlier,
+            imputed=imputed, output_present=output_present,
+            residual_km=residual, threshold_km=threshold,
+            residual_mean_km=res_mean, residual_std_km=res_std,
+            degree=degree, rmse_km=rmse, max_residual_km=max_res,
+            can_impute=can_impute,
         )
 
-        base_res = residual_i[valid]
-        base_res = base_res[np.isfinite(base_res)]
-        if len(base_res) == 0:
-            break
-
-        med = float(np.median(base_res))
-        mad = float(np.median(np.abs(base_res - med)))
-        scale = 1.4826 * mad
-        if not np.isfinite(scale) or scale < temporal_min_scale_km:
-            scale = float(temporal_min_scale_km)
-
-        threshold = max(float(temporal_outlier_km), float(temporal_sigma) * scale)
-        new_valid = initial_valid & np.isfinite(residual_i) & (residual_i <= threshold)
-
-        if int(new_valid.sum()) < max(2, min_track_points):
-            # No aceptamos una iteración que deje la trayectoria sin soporte.
-            new_valid = valid.copy()
-
-        pred_lat = pred_lat_i
-        pred_lon = pred_lon_i
-        residual_km = residual_i
-        threshold_km = threshold
-        degree = int(max(degree_lat, degree_lon))
-
-        if last_valid is not None and np.array_equal(new_valid, last_valid):
-            valid = new_valid
-            break
-        if np.array_equal(new_valid, valid):
-            valid = new_valid
-            break
-
-        last_valid = valid.copy()
-        valid = new_valid
-
-    temporal_good = valid.copy()
-    temporal_outlier = finite & pre_spatial_ok & (~temporal_good)
-
-    if np.isfinite(residual_km[temporal_good]).any():
-        rmse_km = float(np.sqrt(np.nanmean(residual_km[temporal_good] ** 2)))
-        max_residual_km = float(np.nanmax(residual_km[temporal_good]))
-
-    # Salida: conservar observaciones buenas. Imputar outliers / pre-spatial bad / huecos cortos.
-    output_present = temporal_good.copy()
-
-    if degree >= 0 and np.isfinite(pred_lon).all() and np.isfinite(pred_lat).all():
-        for i in range(n_frames):
-            if temporal_good[i]:
-                continue
-
-            missing = not observed[i]
-            bad_observation = observed[i] and (not temporal_good[i])
-
-            if missing and not fill_missing:
-                continue
-
-            if missing or bad_observation:
-                if can_fill_frame(i, temporal_good, max_gap_frames, allow_extrapolation):
-                    output_present[i] = True
-                    imputed[i] = True
-
-    return TrackResult(
-        key=key,
-        sourceX=sourceX,
-        sourceY=sourceY,
-        observed=observed,
-        finite=finite,
-        pre_spatial_ok=pre_spatial_ok,
-        temporal_good=temporal_good,
-        temporal_outlier=temporal_outlier,
-        imputed=imputed,
-        output_present=output_present,
-        raw_lon=raw_lon,
-        raw_lat=raw_lat,
-        pred_lon=pred_lon,
-        pred_lat=pred_lat,
-        residual_km=residual_km,
-        threshold_km=threshold_km,
-        degree=degree,
-        rmse_km=rmse_km,
-        max_residual_km=max_residual_km,
-    )
+    return results
 
 
-def row_to_output_dict(row: pd.Series, output_columns: List[str]) -> Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# Output construction
+# -----------------------------------------------------------------------------
+
+
+def row_to_output_dict(row: Optional[pd.Series], output_columns: Sequence[str]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for col in output_columns:
-        if col in row.index and not col.startswith("_"):
+        if row is not None and col in row.index and not str(col).startswith("__"):
             out[col] = row[col]
         elif col == "enable":
             out[col] = 1
         elif col in {"dX", "dY", "residual"}:
             out[col] = 0.0
-        elif col in {"temporal_status", "temporal_residual_km"}:
-            out[col] = ""
+        elif col in {"temporal_status", "temporal_residual_km", "temporal_threshold_km"}:
+            out[col] = np.nan
         else:
             out[col] = np.nan
     return out
 
 
-def create_template_row(track: pd.DataFrame, output_columns: List[str]) -> Dict[str, Any]:
-    if len(track) > 0:
-        return row_to_output_dict(track.iloc[0], output_columns)
-    return {col: np.nan for col in output_columns}
-
-
-def build_temporally_consistent_outputs(
+def build_outputs_by_frame(
+    all_df: pd.DataFrame,
     frames: List[FrameInfo],
-    long_df: pd.DataFrame,
-    output_columns: List[str],
-    temporal_order: int,
-    temporal_outlier_km: float,
-    temporal_sigma: float,
-    temporal_min_scale_km: float,
-    temporal_max_iter: int,
-    min_track_points: int,
-    max_gap_frames: int,
-    allow_extrapolation: bool,
-    fill_missing: bool,
+    track_results: Dict[str, TrackResult],
+    output_columns: Sequence[str],
     add_qc_columns: bool,
-    disable_temporal: bool,
-) -> Tuple[Dict[int, pd.DataFrame], List[TrackResult], pd.DataFrame]:
-    """
-    Ejecuta coherencia temporal para todos los sourceX/sourceY.
-    """
+) -> Dict[int, pd.DataFrame]:
     n_frames = len(frames)
-    t_norm = np.linspace(-1.0, 1.0, n_frames, dtype=float) if n_frames > 1 else np.array([0.0])
+    outputs: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(n_frames)}
+    grouped = {key: g.sort_values(["__frame_index", "__row_index"]) for key, g in all_df.groupby("__source_key")}
 
-    outputs_by_frame: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    track_results: List[TrackResult] = []
-    summary_rows: List[Dict[str, Any]] = []
-
-    if long_df.empty:
-        return {i: pd.DataFrame(columns=output_columns) for i in range(n_frames)}, track_results, pd.DataFrame()
-
-    grouped = long_df.groupby("_source_key", sort=True)
-
-    for key, track in grouped:
-        if disable_temporal:
-            # Modo antiguo ampliado: conservar únicamente las observaciones pre_spatial_ok.
-            sourceX, sourceY = parse_source_key(str(key))
-            observed = np.zeros(n_frames, dtype=bool)
-            finite = np.zeros(n_frames, dtype=bool)
-            pre_ok = np.zeros(n_frames, dtype=bool)
-            raw_lon = np.full(n_frames, np.nan)
-            raw_lat = np.full(n_frames, np.nan)
+    for key, tr in track_results.items():
+        track = grouped.get(key)
+        rows_by_frame: Dict[int, pd.Series] = {}
+        if track is not None:
             for _, row in track.iterrows():
-                i = int(row["_frame_index"])
-                observed[i] = True
-                raw_lon[i] = float(row["mapX"])
-                raw_lat[i] = float(row["mapY"])
-                finite[i] = np.isfinite(raw_lon[i]) and np.isfinite(raw_lat[i])
-                pre_ok[i] = bool(row["_pre_spatial_ok"])
-                if pre_ok[i] and finite[i]:
-                    out = row_to_output_dict(row, output_columns)
-                    if add_qc_columns:
-                        out["temporal_status"] = "kept_no_temporal"
-                        out["temporal_residual_km"] = 0.0
-                    outputs_by_frame[i].append(out)
+                fi = int(row["__frame_index"])
+                if fi not in rows_by_frame:
+                    rows_by_frame[fi] = row
 
-            result = TrackResult(
-                key=str(key), sourceX=sourceX, sourceY=sourceY,
-                observed=observed, finite=finite, pre_spatial_ok=pre_ok,
-                temporal_good=pre_ok & finite, temporal_outlier=np.zeros(n_frames, dtype=bool),
-                imputed=np.zeros(n_frames, dtype=bool), output_present=pre_ok & finite,
-                raw_lon=raw_lon, raw_lat=raw_lat,
-                pred_lon=np.full(n_frames, np.nan), pred_lat=np.full(n_frames, np.nan),
-                residual_km=np.full(n_frames, np.nan), threshold_km=float("nan"),
-                degree=-1, rmse_km=float("nan"), max_residual_km=float("nan"),
-            )
-        else:
-            result = robust_temporal_fit_track(
-                track=track,
-                n_frames=n_frames,
-                t_norm=t_norm,
-                temporal_order=temporal_order,
-                temporal_outlier_km=temporal_outlier_km,
-                temporal_sigma=temporal_sigma,
-                temporal_min_scale_km=temporal_min_scale_km,
-                temporal_max_iter=temporal_max_iter,
-                min_track_points=min_track_points,
-                max_gap_frames=max_gap_frames,
-                allow_extrapolation=allow_extrapolation,
-                fill_missing=fill_missing,
-            )
-
-            # Acceso rápido a filas originales por frame.
-            track_by_frame: Dict[int, pd.Series] = {}
-            for _, row in track.sort_values(["_frame_index", "_row_index"]).iterrows():
-                i = int(row["_frame_index"])
-                if i not in track_by_frame:
-                    track_by_frame[i] = row
-
-            template = create_template_row(track, output_columns)
-            template["sourceX"] = result.sourceX
-            template["sourceY"] = result.sourceY
-
-            for i in range(n_frames):
-                if not result.output_present[i]:
-                    continue
-
-                if result.temporal_good[i] and i in track_by_frame:
-                    out = row_to_output_dict(track_by_frame[i], output_columns)
-                    status = "kept"
-                else:
-                    # Outlier o hueco imputado.
-                    base = track_by_frame.get(i, None)
-                    out = row_to_output_dict(base, output_columns) if base is not None else dict(template)
-                    out["mapX"] = float(result.pred_lon[i])
-                    out["mapY"] = float(result.pred_lat[i])
-                    out["sourceX"] = float(result.sourceX)
-                    out["sourceY"] = float(result.sourceY)
-                    out["enable"] = 1
-                    out["dX"] = 0.0
-                    out["dY"] = 0.0
-                    out["residual"] = 0.0
-                    status = "imputed"
-                    frames[i].n_imputed += 1
-
-                if add_qc_columns:
-                    out["temporal_status"] = status
-                    r = result.residual_km[i]
-                    out["temporal_residual_km"] = float(r) if np.isfinite(r) else np.nan
-
-                outputs_by_frame[i].append(out)
+        template_row = next(iter(rows_by_frame.values()), None)
+        template = row_to_output_dict(template_row, output_columns)
+        template["sourceX"] = tr.sourceX
+        template["sourceY"] = tr.sourceY
 
         for i in range(n_frames):
-            if result.temporal_outlier[i]:
-                frames[i].n_temporal_outliers += 1
-            if result.observed[i] and result.finite[i] and (not result.pre_spatial_ok[i]):
-                frames[i].n_pre_spatial_rejected_used_as_missing += 1
+            if not tr.output_present[i]:
+                continue
 
-        track_results.append(result)
-        summary_rows.append({
-            "source_key": result.key,
-            "sourceX": result.sourceX,
-            "sourceY": result.sourceY,
-            "n_observed": int(result.observed.sum()),
-            "n_finite": int(result.finite.sum()),
-            "n_pre_spatial_ok": int(result.pre_spatial_ok.sum()),
-            "n_temporal_good": int(result.temporal_good.sum()),
-            "n_temporal_outliers": int(result.temporal_outlier.sum()),
-            "n_imputed": int(result.imputed.sum()),
-            "n_output": int(result.output_present.sum()),
-            "fit_degree": int(result.degree),
-            "threshold_km_last": result.threshold_km,
-            "rmse_km": result.rmse_km,
-            "max_residual_km": result.max_residual_km,
-        })
+            if tr.fit_used[i] and not tr.imputed[i] and i in rows_by_frame:
+                out = row_to_output_dict(rows_by_frame[i], output_columns)
+                status = "kept"
+            elif tr.imputed[i]:
+                out = dict(template)
+                if i in rows_by_frame:
+                    # Preserve non-geographic ancillary columns from the original row
+                    # when an original bad observation existed.
+                    original = row_to_output_dict(rows_by_frame[i], output_columns)
+                    for c, v in original.items():
+                        if c not in {"mapX", "mapY", "enable", "dX", "dY", "residual"}:
+                            out[c] = v
+                out["mapX"] = float(tr.pred_lon[i])
+                out["mapY"] = float(tr.pred_lat[i])
+                out["sourceX"] = float(tr.sourceX)
+                out["sourceY"] = float(tr.sourceY)
+                out["enable"] = 1
+                out["dX"] = 0.0
+                out["dY"] = 0.0
+                out["residual"] = 0.0
+                status = "imputed"
+                frames[i].n_imputed += 1
+            else:
+                continue
+
+            if add_qc_columns:
+                out["temporal_status"] = status
+                out["temporal_residual_km"] = float(tr.residual_km[i]) if np.isfinite(tr.residual_km[i]) else np.nan
+                out["temporal_threshold_km"] = float(tr.threshold_km) if np.isfinite(tr.threshold_km) else np.nan
+
+            outputs[i].append(out)
 
     output_dfs: Dict[int, pd.DataFrame] = {}
-    for i in range(n_frames):
-        rows = outputs_by_frame.get(i, [])
-        df = pd.DataFrame(rows, columns=output_columns)
+    for info in frames:
+        rows = outputs.get(info.frame_index, [])
+        df = pd.DataFrame(rows, columns=list(output_columns))
         if not df.empty:
-            # Orden estable: de arriba a abajo en coordenadas de imagen y luego izquierda-derecha.
             sort_y = -pd.to_numeric(df["sourceY"], errors="coerce")
             sort_x = pd.to_numeric(df["sourceX"], errors="coerce")
-            df = df.assign(_sort_y=sort_y, _sort_x=sort_x).sort_values(["_sort_y", "_sort_x"])
-            df = df.drop(columns=["_sort_y", "_sort_x"])
-        frames[i].output_before_post_spatial = len(df)
-        output_dfs[i] = df
+            df = df.assign(__sort_y=sort_y, __sort_x=sort_x).sort_values(["__sort_y", "__sort_x"])
+            df = df.drop(columns=["__sort_y", "__sort_x"])
+        info.output_before_post_spatial = len(df)
+        output_dfs[info.frame_index] = df
 
-    track_summary = pd.DataFrame(summary_rows)
-    return output_dfs, track_results, track_summary
+    return output_dfs
 
 
 def apply_post_spatial_filter_to_outputs(
@@ -755,45 +712,39 @@ def apply_post_spatial_filter_to_outputs(
         if df.empty or not post_spatial_filter:
             filtered[info.frame_index] = df.copy()
             info.post_spatial_kept = len(df)
+            info.n_post_spatial_rejected = 0
             continue
 
         mask = spatial_neighbor_mask(df, radius_km=radius_km)
         filtered_df = df.loc[mask].copy()
         info.post_spatial_kept = len(filtered_df)
+        info.n_post_spatial_rejected = len(df) - len(filtered_df)
         filtered[info.frame_index] = filtered_df
     return filtered
 
 
-def write_outputs(
-    output_dfs: Dict[int, pd.DataFrame],
-    frames: List[FrameInfo],
-    output_folder: str,
-    output_columns: List[str],
-) -> None:
+def write_outputs(output_dfs: Dict[int, pd.DataFrame], frames: List[FrameInfo], output_folder: str) -> None:
     out_dir = Path(output_folder)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for info in frames:
-        df = output_dfs.get(info.frame_index, pd.DataFrame(columns=output_columns))
+        df = output_dfs.get(info.frame_index, pd.DataFrame())
         output_path = out_dir / info.output_name
         df.to_csv(output_path, index=False)
         if df.empty:
-            print(f"⚠️ {info.output_name}: se guarda vacío tras filtros.")
+            print(f"WARNING: {info.output_name}: empty after filters.")
         print(
-            f"✅ {info.output_name}: input={info.input_count}, "
-            f"pre_spatial={info.pre_spatial_kept}, "
+            f"OK {info.output_name}: input={info.input_count}, "
+            f"pre_spatial_diag={info.pre_spatial_kept}, "
             f"temp_outliers={info.n_temporal_outliers}, "
-            f"imputed={info.n_imputed}, "
-            f"final={len(df)}"
+            f"imputed={info.n_imputed}, final={len(df)}"
         )
 
 
-def write_qc_tables(
-    frames: List[FrameInfo],
-    track_summary: pd.DataFrame,
-    output_folder: str,
-) -> None:
+def write_qc_tables(frames: List[FrameInfo], track_results: Dict[str, TrackResult], output_folder: str) -> None:
     out_dir = Path(output_folder)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     frame_rows = []
     for info in frames:
         frame_rows.append({
@@ -802,60 +753,83 @@ def write_qc_tables(
             "input_name": info.input_name,
             "output_name": info.output_name,
             "input_count": info.input_count,
-            "pre_spatial_kept": info.pre_spatial_kept,
-            "pre_spatial_rejected": info.input_count - info.pre_spatial_kept,
-            "pre_spatial_rejected_used_as_missing": info.n_pre_spatial_rejected_used_as_missing,
+            "pre_spatial_kept_diagnostic": info.pre_spatial_kept,
             "temporal_outliers": info.n_temporal_outliers,
             "imputed": info.n_imputed,
             "output_before_post_spatial": info.output_before_post_spatial,
             "post_spatial_kept": info.post_spatial_kept,
-            "post_spatial_rejected": info.output_before_post_spatial - info.post_spatial_kept,
+            "post_spatial_rejected": info.n_post_spatial_rejected,
         })
-    frame_summary = pd.DataFrame(frame_rows)
-    frame_summary.to_csv(out_dir / "temporal_frame_summary.csv", index=False)
-    if track_summary is not None and not track_summary.empty:
-        track_summary.to_csv(out_dir / "temporal_track_summary.csv", index=False)
+    pd.DataFrame(frame_rows).to_csv(out_dir / "temporal_frame_summary.csv", index=False)
+
+    track_rows = []
+    for tr in track_results.values():
+        track_rows.append({
+            "source_key": tr.key,
+            "sourceX": tr.sourceX,
+            "sourceY": tr.sourceY,
+            "n_observed": int(tr.observed.sum()),
+            "n_finite": int(tr.finite.sum()),
+            "n_pre_spatial_ok_diagnostic": int(tr.pre_spatial_ok.sum()),
+            "n_fit_used": int(tr.fit_used.sum()),
+            "n_temporal_outliers": int(tr.temporal_outlier.sum()),
+            "n_imputed": int(tr.imputed.sum()),
+            "n_output": int(tr.output_present.sum()),
+            "can_impute": bool(tr.can_impute),
+            "fit_degree": int(tr.degree),
+            "threshold_km": tr.threshold_km,
+            "residual_mean_km": tr.residual_mean_km,
+            "residual_std_km": tr.residual_std_km,
+            "rmse_km": tr.rmse_km,
+            "max_residual_km": tr.max_residual_km,
+        })
+    pd.DataFrame(track_rows).to_csv(out_dir / "temporal_track_summary.csv", index=False)
 
 
-def choose_plot_tracks(track_results: List[TrackResult], requested_keys: Optional[List[str]] = None) -> List[Tuple[str, TrackResult]]:
-    """
-    Selecciona tracks representativos: esquinas y centro en coordenadas de imagen real.
-    sourceY es negativo de y_imagen; usamos image_y = -sourceY.
-    """
-    valid_tracks = [tr for tr in track_results if int(tr.observed.sum()) > 0]
-    if not valid_tracks:
+# -----------------------------------------------------------------------------
+# Diagnostics and plots
+# -----------------------------------------------------------------------------
+
+
+def safe_filename_fragment(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
+
+
+def choose_diagnostic_tracks(
+    track_results: Dict[str, TrackResult],
+    diagnostic_inset: float,
+    min_diagnostic_observations: int,
+) -> List[Tuple[str, TrackResult]]:
+    candidates = [tr for tr in track_results.values() if int(tr.finite.sum()) >= int(min_diagnostic_observations)]
+    if not candidates:
+        candidates = [tr for tr in track_results.values() if int(tr.finite.sum()) > 0]
+    if not candidates:
         return []
 
-    if requested_keys:
-        by_key = {tr.key: tr for tr in valid_tracks}
-        out = []
-        for key in requested_keys:
-            if key in by_key:
-                out.append(("requested", by_key[key]))
-        return out
-
-    sx = np.array([tr.sourceX for tr in valid_tracks], dtype=float)
-    iy = np.array([-tr.sourceY for tr in valid_tracks], dtype=float)
+    sx = np.array([tr.sourceX for tr in candidates], dtype=float)
+    iy = np.array([-tr.sourceY for tr in candidates], dtype=float)
 
     xmin, xmax = float(np.nanmin(sx)), float(np.nanmax(sx))
     ymin, ymax = float(np.nanmin(iy)), float(np.nanmax(iy))
-    xmid, ymid = float(np.nanmedian(sx)), float(np.nanmedian(iy))
+    dx = xmax - xmin
+    dy = ymax - ymin
 
+    inset = float(np.clip(diagnostic_inset, 0.0, 0.49))
     targets = {
-        "top_left": (xmin, ymin),
-        "top_right": (xmax, ymin),
-        "center": (xmid, ymid),
-        "bottom_left": (xmin, ymax),
-        "bottom_right": (xmax, ymax),
+        "top_left_inner": (xmin + inset * dx, ymin + inset * dy),
+        "top_right_inner": (xmax - inset * dx, ymin + inset * dy),
+        "center": (0.5 * (xmin + xmax), 0.5 * (ymin + ymax)),
+        "bottom_left_inner": (xmin + inset * dx, ymax - inset * dy),
+        "bottom_right_inner": (xmax - inset * dx, ymax - inset * dy),
     }
 
     chosen: List[Tuple[str, TrackResult]] = []
-    used = set()
+    used: set[str] = set()
     for label, (tx, ty) in targets.items():
         d2 = (sx - tx) ** 2 + (iy - ty) ** 2
         order = np.argsort(d2)
         for idx in order:
-            tr = valid_tracks[int(idx)]
+            tr = candidates[int(idx)]
             if tr.key not in used:
                 chosen.append((label, tr))
                 used.add(tr.key)
@@ -863,66 +837,55 @@ def choose_plot_tracks(track_results: List[TrackResult], requested_keys: Optiona
     return chosen
 
 
-def safe_filename_fragment(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s)
-
-
-def plot_track_evolution(
-    label: str,
-    tr: TrackResult,
-    frames: List[FrameInfo],
-    plot_dir: Path,
-) -> None:
-    frame_ids = np.array([f.frame_id for f in frames], dtype=int)
+def plot_track_evolution(label: str, tr: TrackResult, frames: List[FrameInfo], plot_dir: Path) -> None:
     x = np.arange(len(frames), dtype=int)
-
     fig, axes = plt.subplots(3, 1, figsize=(13, 10), sharex=True)
 
     obs = tr.observed & tr.finite
-    good = tr.temporal_good
+    good = tr.fit_used
     outl = tr.temporal_outlier
     imp = tr.imputed
-    outp = tr.output_present
 
-    # Latitud
     ax = axes[0]
-    ax.plot(x[np.isfinite(tr.pred_lat)], tr.pred_lat[np.isfinite(tr.pred_lat)], linewidth=1.5, label="polinomio")
-    ax.scatter(x[obs], tr.raw_lat[obs], s=14, alpha=0.55, label="observado")
-    ax.scatter(x[good], tr.raw_lat[good], s=18, label="usado en ajuste")
-    ax.scatter(x[outl], tr.raw_lat[outl], s=30, marker="x", label="outlier temporal")
-    ax.scatter(x[imp], tr.pred_lat[imp], s=28, marker="D", label="imputado")
-    ax.set_ylabel("latitud mapY")
+    valid_pred = np.isfinite(tr.pred_lat)
+    ax.plot(x[valid_pred], tr.pred_lat[valid_pred], linewidth=1.5, label="polynomial")
+    ax.scatter(x[obs], tr.raw_lat[obs], s=14, alpha=0.55, label="observed")
+    ax.scatter(x[good], tr.raw_lat[good], s=18, label="used in fit")
+    ax.scatter(x[outl], tr.raw_lat[outl], s=30, marker="x", label="temporal outlier")
+    ax.scatter(x[imp], tr.pred_lat[imp], s=28, marker="D", label="imputed")
+    ax.set_ylabel("latitude mapY")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=8)
 
-    # Longitud
     ax = axes[1]
-    ax.plot(x[np.isfinite(tr.pred_lon)], tr.pred_lon[np.isfinite(tr.pred_lon)], linewidth=1.5, label="polinomio")
-    ax.scatter(x[obs], tr.raw_lon[obs], s=14, alpha=0.55, label="observado")
-    ax.scatter(x[good], tr.raw_lon[good], s=18, label="usado en ajuste")
-    ax.scatter(x[outl], tr.raw_lon[outl], s=30, marker="x", label="outlier temporal")
-    ax.scatter(x[imp], tr.pred_lon[imp], s=28, marker="D", label="imputado")
-    ax.set_ylabel("longitud mapX")
+    valid_pred = np.isfinite(tr.pred_lon)
+    ax.plot(x[valid_pred], tr.pred_lon[valid_pred], linewidth=1.5, label="polynomial")
+    ax.scatter(x[obs], tr.raw_lon[obs], s=14, alpha=0.55, label="observed")
+    ax.scatter(x[good], tr.raw_lon[good], s=18, label="used in fit")
+    ax.scatter(x[outl], tr.raw_lon[outl], s=30, marker="x", label="temporal outlier")
+    ax.scatter(x[imp], tr.pred_lon[imp], s=28, marker="D", label="imputed")
+    ax.set_ylabel("longitude mapX")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=8)
 
-    # Residuo
     ax = axes[2]
     finite_res = np.isfinite(tr.residual_km)
-    ax.scatter(x[finite_res], tr.residual_km[finite_res], s=14, alpha=0.65, label="residuo obs-polí")
+    ax.scatter(x[finite_res], tr.residual_km[finite_res], s=14, alpha=0.65, label="obs-poly residual")
     if np.isfinite(tr.threshold_km):
-        ax.axhline(tr.threshold_km, linestyle="--", linewidth=1.0, label=f"umbral {tr.threshold_km:.1f} km")
+        ax.axhline(tr.threshold_km, linestyle="--", linewidth=1.0, label=f"threshold {tr.threshold_km:.1f} km")
     ax.scatter(x[outl], tr.residual_km[outl], s=30, marker="x", label="outlier")
-    ax.set_ylabel("residuo km")
+    ax.set_ylabel("residual km")
     ax.set_xlabel("frame index")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best", fontsize=8)
 
+    rmse_txt = f"{tr.rmse_km:.2f}" if np.isfinite(tr.rmse_km) else "nan"
+    thr_txt = f"{tr.threshold_km:.2f}" if np.isfinite(tr.threshold_km) else "nan"
     title = (
         f"{label}: sourceX={tr.sourceX:.2f}, sourceY={tr.sourceY:.2f} | "
-        f"obs={int(tr.observed.sum())}, good={int(tr.temporal_good.sum())}, "
+        f"obs={int(tr.observed.sum())}, good={int(tr.fit_used.sum())}, "
         f"outliers={int(tr.temporal_outlier.sum())}, imputed={int(tr.imputed.sum())}, "
-        f"degree={tr.degree}, rmse={tr.rmse_km:.2f} km"
+        f"degree={tr.degree}, rmse={rmse_txt} km, threshold={thr_txt} km"
     )
     fig.suptitle(title)
     fig.tight_layout(rect=[0, 0.02, 1, 0.96])
@@ -934,16 +897,15 @@ def plot_track_evolution(
 
 def plot_frame_qc(frames: List[FrameInfo], plot_dir: Path) -> None:
     x = np.arange(len(frames), dtype=int)
-    frame_ids = [f.frame_id for f in frames]
 
     fig, ax = plt.subplots(figsize=(13, 5))
     ax.plot(x, [f.input_count for f in frames], label="input")
-    ax.plot(x, [f.pre_spatial_kept for f in frames], label="pre_spatial_kept")
+    ax.plot(x, [f.pre_spatial_kept for f in frames], label="pre_spatial_diag")
     ax.plot(x, [f.output_before_post_spatial for f in frames], label="output_before_post")
     ax.plot(x, [f.post_spatial_kept for f in frames], label="final")
-    ax.set_title("Número de puntos por frame")
+    ax.set_title("Number of points per frame")
     ax.set_xlabel("frame index")
-    ax.set_ylabel("n puntos")
+    ax.set_ylabel("n points")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -951,12 +913,12 @@ def plot_frame_qc(frames: List[FrameInfo], plot_dir: Path) -> None:
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(13, 5))
-    ax.plot(x, [f.n_temporal_outliers for f in frames], label="outliers temporales")
-    ax.plot(x, [f.n_imputed for f in frames], label="imputados")
-    ax.plot(x, [f.output_before_post_spatial - f.post_spatial_kept for f in frames], label="rechazados post-spatial")
-    ax.set_title("Control de calidad temporal/espacial por frame")
+    ax.plot(x, [f.n_temporal_outliers for f in frames], label="temporal outliers")
+    ax.plot(x, [f.n_imputed for f in frames], label="imputed")
+    ax.plot(x, [f.n_post_spatial_rejected for f in frames], label="post-spatial rejected")
+    ax.set_title("Temporal/spatial quality control per frame")
     ax.set_xlabel("frame index")
-    ax.set_ylabel("n puntos")
+    ax.set_ylabel("n points")
     ax.grid(True, alpha=0.25)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -964,22 +926,271 @@ def plot_frame_qc(frames: List[FrameInfo], plot_dir: Path) -> None:
     plt.close(fig)
 
 
+def get_image_files(image_dir: Path) -> List[Path]:
+    exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+    return sorted([p for p in image_dir.iterdir() if p.suffix.lower() in exts])
+
+
+def parse_reference_frame_indices(spec: str, n_frames: int) -> List[int]:
+    if not spec:
+        return []
+    indices: List[int] = []
+    for token in [t.strip().lower() for t in spec.split(",") if t.strip()]:
+        if token == "first":
+            indices.append(0)
+        elif token in {"mid", "middle", "center"}:
+            indices.append(n_frames // 2)
+        elif token == "last":
+            indices.append(n_frames - 1)
+        else:
+            try:
+                val = int(token)
+                if 0 <= val < n_frames:
+                    indices.append(val)
+            except ValueError:
+                pass
+    out: List[int] = []
+    for i in indices:
+        if i not in out and 0 <= i < n_frames:
+            out.append(i)
+    return out
+
+
+def xy_from_keys(keys: Sequence[str], track_results: Dict[str, TrackResult]) -> Tuple[np.ndarray, np.ndarray]:
+    xs: List[float] = []
+    ys: List[float] = []
+    for key in keys:
+        tr = track_results.get(key)
+        if tr is not None:
+            xs.append(float(tr.sourceX))
+            ys.append(float(-tr.sourceY))
+            continue
+        try:
+            sx, sy = parse_source_key(key)
+            xs.append(float(sx))
+            ys.append(float(-sy))
+        except Exception:
+            continue
+    return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
+
+
+def plot_diagnostic_points_on_images(
+    all_df: pd.DataFrame,
+    final_dfs: Dict[int, pd.DataFrame],
+    track_results: Dict[str, TrackResult],
+    frames: List[FrameInfo],
+    chosen_tracks: List[Tuple[str, TrackResult]],
+    image_dir: Optional[str],
+    plot_dir: Path,
+    reference_spec: str,
+    source_round_decimals: int,
+) -> None:
+    """
+    Overlay QC on real images for selected frames.
+
+    Mutually exclusive visual coding:
+      - blue circles: original points that survive and were not touched;
+      - red circles: non-imputed/non-outlier points rejected by final filtering;
+      - green diamonds: temporal outliers/imputed points that survive final filtering;
+      - orange diamonds: temporal outliers/imputed points rejected by final filtering;
+      - yellow stars: selected diagnostic tracks.
+    """
+    if not image_dir or not reference_spec or not chosen_tracks:
+        return
+
+    img_dir = Path(image_dir)
+    if not img_dir.exists():
+        print(f"WARNING: image_dir does not exist, skipping overlays: {img_dir}")
+        return
+
+    image_files = get_image_files(img_dir)
+    if not image_files:
+        print(f"WARNING: no images found in {img_dir}; skipping overlays.")
+        return
+
+    frame_indices = parse_reference_frame_indices(reference_spec, len(frames))
+    if not frame_indices:
+        return
+
+    label_effect = [pe.withStroke(linewidth=3.5, foreground="black")]
+
+    for fi in frame_indices:
+        if fi >= len(frames):
+            continue
+        if fi >= len(image_files):
+            print(f"WARNING: no image for frame_index={fi}; skipping overlay.")
+            continue
+
+        img_path = image_files[fi]
+        try:
+            img = ImageOps.exif_transpose(Image.open(img_path)).convert("RGB")
+        except Exception as exc:
+            print(f"WARNING: could not open {img_path}: {exc}")
+            continue
+
+        frame_points = all_df[all_df["__frame_index"] == fi].copy()
+        final_df = final_dfs.get(fi, pd.DataFrame())
+
+        final_keys: set[str] = set()
+        if final_df is not None and not final_df.empty and {"sourceX", "sourceY"}.issubset(final_df.columns):
+            sx_final = pd.to_numeric(final_df["sourceX"], errors="coerce").to_numpy(dtype=float)
+            sy_final = pd.to_numeric(final_df["sourceY"], errors="coerce").to_numpy(dtype=float)
+            finite_final = np.isfinite(sx_final) & np.isfinite(sy_final)
+            final_keys = {
+                make_source_key(x, y, source_round_decimals)
+                for x, y in zip(sx_final[finite_final], sy_final[finite_final])
+            }
+
+        input_keys: set[str] = set()
+        if not frame_points.empty:
+            input_keys = set(frame_points["__source_key"].astype(str).tolist())
+
+        # Outliers and imputed points are one visual class for this diagnostic.
+        corrected_keys: set[str] = set()
+        for key, tr in track_results.items():
+            if fi >= len(tr.output_present):
+                continue
+            if bool(tr.temporal_outlier[fi]) or bool(tr.imputed[fi]):
+                corrected_keys.add(key)
+
+        all_visible_keys = input_keys | final_keys | corrected_keys
+
+        blue_keys = sorted(k for k in all_visible_keys if k in final_keys and k not in corrected_keys)
+        green_keys = sorted(k for k in all_visible_keys if k in final_keys and k in corrected_keys)
+        orange_keys = sorted(k for k in all_visible_keys if k not in final_keys and k in corrected_keys)
+        red_keys = sorted(k for k in all_visible_keys if k not in final_keys and k not in corrected_keys)
+
+        fig, ax = plt.subplots(figsize=(13, 8.5))
+        ax.imshow(img, origin="upper")
+
+        rx, ry = xy_from_keys(red_keys, track_results)
+        if len(rx):
+            ax.scatter(
+                rx, ry,
+                s=34, marker="o",
+                facecolors="red", edgecolors="black", linewidths=0.25,
+                alpha=0.90, zorder=3,
+                label=f"removed by filtering ({len(rx)})",
+            )
+
+        bx, by = xy_from_keys(blue_keys, track_results)
+        if len(bx):
+            ax.scatter(
+                bx, by,
+                s=22, marker="o",
+                facecolors="dodgerblue", edgecolors="black", linewidths=0.20,
+                alpha=0.90, zorder=4,
+                label=f"untouched kept ({len(bx)})",
+            )
+
+        ox, oy = xy_from_keys(orange_keys, track_results)
+        if len(ox):
+            ax.scatter(
+                ox, oy,
+                s=74, marker="D",
+                facecolors="orange", edgecolors="black", linewidths=0.75,
+                alpha=0.98, zorder=6,
+                label=f"outlier/imputed removed ({len(ox)})",
+            )
+
+        gx, gy = xy_from_keys(green_keys, track_results)
+        if len(gx):
+            ax.scatter(
+                gx, gy,
+                s=74, marker="D",
+                facecolors="lime", edgecolors="black", linewidths=0.75,
+                alpha=0.98, zorder=7,
+                label=f"outlier/imputed kept ({len(gx)})",
+            )
+
+        for label, tr in chosen_tracks:
+            x = float(tr.sourceX)
+            y = float(-tr.sourceY)
+            if tr.key in green_keys:
+                status = "imputed kept"
+            elif tr.key in orange_keys:
+                status = "imputed removed"
+            elif tr.key in blue_keys:
+                status = "kept"
+            elif tr.key in red_keys:
+                status = "removed"
+            else:
+                status = "missing"
+
+            ax.scatter(
+                [x], [y],
+                s=190, marker="*",
+                facecolors="yellow", edgecolors="black", linewidths=1.1,
+                label="diagnostic tracks" if label == chosen_tracks[0][0] else None,
+                zorder=11,
+            )
+            ax.text(
+                x + 24, y - 24, f"{label}\n{status}",
+                fontsize=9, weight="bold", color="white",
+                path_effects=label_effect,
+                bbox=dict(facecolor="black", alpha=0.55, edgecolor="white", linewidth=0.35, pad=2.5),
+                zorder=12,
+            )
+
+        ax.set_title(
+            f"Grid filtering status on real image | frame {fi} | {img_path.name}\n"
+            "blue = untouched kept, green = outlier/imputed kept, orange = outlier/imputed removed, red = removed"
+        )
+        ax.set_xlim(0, img.width)
+        ax.set_ylim(img.height, 0)
+        ax.legend(loc="best", fontsize=8, framealpha=0.88)
+        ax.grid(False)
+        fig.tight_layout()
+
+        out_name = f"grid_filter_status_frame_{fi:04d}_{safe_filename_fragment(img_path.stem)}.png"
+        fig.savefig(plot_dir / out_name, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+
+
 def make_plots(
-    track_results: List[TrackResult],
+    all_df: pd.DataFrame,
+    final_dfs: Dict[int, pd.DataFrame],
+    track_results: Dict[str, TrackResult],
     frames: List[FrameInfo],
     plot_dir: Optional[str],
-    max_plot_tracks: int,
+    image_dir: Optional[str],
+    plot_reference_frames: str,
+    diagnostic_inset: float,
+    min_diagnostic_observations: int,
+    source_round_decimals: int,
 ) -> None:
     if not plot_dir:
         return
     out = Path(plot_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    chosen = choose_plot_tracks(track_results)[:max(0, max_plot_tracks)]
+    chosen = choose_diagnostic_tracks(
+        track_results=track_results,
+        diagnostic_inset=diagnostic_inset,
+        min_diagnostic_observations=min_diagnostic_observations,
+    )
+
     for label, tr in chosen:
         plot_track_evolution(label, tr, frames, out)
+
     plot_frame_qc(frames, out)
-    print(f"🖼️ Plots de coherencia temporal guardados en: {out}")
+    plot_diagnostic_points_on_images(
+        all_df=all_df,
+        final_dfs=final_dfs,
+        track_results=track_results,
+        frames=frames,
+        chosen_tracks=chosen,
+        image_dir=image_dir,
+        plot_dir=out,
+        reference_spec=plot_reference_frames,
+        source_round_decimals=source_round_decimals,
+    )
+    print(f"Plots saved in: {out}")
+
+
+# -----------------------------------------------------------------------------
+# Main workflow
+# -----------------------------------------------------------------------------
 
 
 def filter_and_rename_points(
@@ -993,26 +1204,28 @@ def filter_and_rename_points(
     source_round_decimals: int = 3,
     disable_temporal: bool = False,
     temporal_order: int = 3,
+    temporal_threshold_mode: str = "sigma",
     temporal_outlier_km: float = 80.0,
-    temporal_sigma: float = 3.5,
-    temporal_min_scale_km: float = 5.0,
+    temporal_sigma: float = 2.0,
+    temporal_min_threshold_km: float = 0.0,
     temporal_max_iter: int = 4,
     min_track_points: int = 6,
+    min_track_coverage: float = 0.20,
     max_gap_frames: int = 8,
     allow_extrapolation: bool = False,
     fill_missing: bool = True,
-    pre_spatial_filter: bool = True,
+    pre_spatial_filter: bool = False,
     post_spatial_filter: bool = True,
     add_qc_columns: bool = False,
     plot_dir: Optional[str] = None,
-    max_plot_tracks: int = 5,
+    image_dir: Optional[str] = None,
+    plot_reference_frames: str = "",
+    diagnostic_inset: float = 0.25,
+    min_diagnostic_observations: int = 20,
 ) -> None:
-    """
-    Función principal: carga .points, aplica coherencia temporal, filtra y escribe resultados.
-    """
     os.makedirs(output_folder, exist_ok=True)
 
-    frames, long_df, first_input_columns = load_timelapse_points(
+    frames, all_df, first_input_columns = load_timelapse_points(
         input_folder=input_folder,
         start_id=start_id,
         end_id=end_id,
@@ -1020,132 +1233,121 @@ def filter_and_rename_points(
         input_glob=input_glob,
         source_round_decimals=source_round_decimals,
         radius_km=radius_km,
-        pre_spatial_filter=pre_spatial_filter,
     )
 
     output_columns = discover_output_columns(first_input_columns, add_qc_columns=add_qc_columns)
 
-    print(f"🔵 Frames cargados: {len(frames)}")
-    print(f"🔵 Observaciones de puntos cargadas: {len(long_df)}")
-    print(f"🔵 Tracks sourceX/sourceY: {0 if long_df.empty else long_df['_source_key'].nunique()}")
-    print(f"🔵 Coherencia temporal: {'desactivada' if disable_temporal else 'activada'}")
-    print(f"🔵 Filtro espacial pre/post: {pre_spatial_filter}/{post_spatial_filter}")
+    print(f"Frames loaded: {len(frames)}")
+    print(f"Point observations loaded: {len(all_df)}")
+    print(f"Tracks sourceX/sourceY: {0 if all_df.empty else all_df['__source_key'].nunique()}")
+    print(f"Temporal consistency: {'disabled' if disable_temporal else 'enabled'}")
+    print(f"Spatial pre/post filter: {pre_spatial_filter}/{post_spatial_filter}")
+    print(f"Final spatial radius: {radius_km:.1f} km")
+    print(f"Temporal threshold: mode={temporal_threshold_mode}, sigma={temporal_sigma}")
 
-    output_dfs, track_results, track_summary = build_temporally_consistent_outputs(
+    if not frames or all_df.empty:
+        print("WARNING: no valid points to process.")
+        return
+
+    track_results = build_track_results(
+        all_df=all_df,
         frames=frames,
-        long_df=long_df,
-        output_columns=output_columns,
         temporal_order=temporal_order,
+        threshold_mode=temporal_threshold_mode,
         temporal_outlier_km=temporal_outlier_km,
         temporal_sigma=temporal_sigma,
-        temporal_min_scale_km=temporal_min_scale_km,
+        temporal_min_threshold_km=temporal_min_threshold_km,
         temporal_max_iter=temporal_max_iter,
         min_track_points=min_track_points,
+        min_track_coverage=min_track_coverage,
         max_gap_frames=max_gap_frames,
-        allow_extrapolation=allow_extrapolation,
         fill_missing=fill_missing,
-        add_qc_columns=add_qc_columns,
+        allow_extrapolation=allow_extrapolation,
+        use_pre_spatial_for_fit=pre_spatial_filter,
         disable_temporal=disable_temporal,
     )
 
-    output_dfs = apply_post_spatial_filter_to_outputs(
+    for tr in track_results.values():
+        for i in np.where(tr.temporal_outlier)[0]:
+            frames[int(i)].n_temporal_outliers += 1
+
+    output_dfs = build_outputs_by_frame(
+        all_df=all_df,
+        frames=frames,
+        track_results=track_results,
+        output_columns=output_columns,
+        add_qc_columns=add_qc_columns,
+    )
+
+    final_dfs = apply_post_spatial_filter_to_outputs(
         output_dfs=output_dfs,
         frames=frames,
         radius_km=radius_km,
         post_spatial_filter=post_spatial_filter,
     )
 
-    write_outputs(
-        output_dfs=output_dfs,
+    write_outputs(final_dfs, frames, output_folder)
+    write_qc_tables(frames, track_results, output_folder)
+    make_plots(
+        all_df=all_df,
+        final_dfs=final_dfs,
+        track_results=track_results,
         frames=frames,
-        output_folder=output_folder,
-        output_columns=output_columns,
+        plot_dir=plot_dir,
+        image_dir=image_dir,
+        plot_reference_frames=plot_reference_frames,
+        diagnostic_inset=diagnostic_inset,
+        min_diagnostic_observations=min_diagnostic_observations,
+        source_round_decimals=source_round_decimals,
     )
 
-    write_qc_tables(frames=frames, track_summary=track_summary, output_folder=output_folder)
-    make_plots(track_results=track_results, frames=frames, plot_dir=plot_dir, max_plot_tracks=max_plot_tracks)
-
-    n_outliers = sum(f.n_temporal_outliers for f in frames)
-    n_imputed = sum(f.n_imputed for f in frames)
-    n_final = sum(f.post_spatial_kept for f in frames)
-
-    print("\n✔️ Filtrado + coherencia temporal completados.")
-    print(f"   Outliers temporales detectados: {n_outliers}")
-    print(f"   Puntos imputados:               {n_imputed}")
-    print(f"   Puntos finales escritos:        {n_final}")
-    print(f"   QC frames: {Path(output_folder) / 'temporal_frame_summary.csv'}")
-    print(f"   QC tracks: {Path(output_folder) / 'temporal_track_summary.csv'}")
+    print("\nTemporal/spatial filtering and renaming completed.")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Filtrado espacial + coherencia temporal de .points: BallTree, ajuste polinómico "
-            "por sourceX/sourceY, detección de outliers e imputación."
-        )
+        description="Temporal/spatial filtering of geographic points and renaming to <mission>-E-<ID>.points"
     )
+    parser.add_argument("--input_folder", type=str, required=True, help="Folder with original *_real.points files")
+    parser.add_argument("--output_folder", type=str, required=True, help="Folder for filtered and renamed .points")
+    parser.add_argument("--radius_km", type=float, default=80.0, help="Final BallTree radius in km")
+    parser.add_argument("--start_id", type=int, required=True, help="Initial image ID")
+    parser.add_argument("--end_id", type=int, required=True, help="Final image ID")
+    parser.add_argument("--mission", type=str, required=True, help="Mission name, e.g. ISS053 or ISS067")
 
-    # Compatibles con el filter_points.py original
-    parser.add_argument("--input_folder", type=str, required=True,
-                        help="Carpeta con archivos .points originales, normalmente *_real.points.")
-    parser.add_argument("--output_folder", type=str, required=True,
-                        help="Carpeta para guardar archivos filtrados/renombrados.")
-    parser.add_argument("--radius_km", type=float, default=130.0,
-                        help="Radio km para BallTree/haversine en filtro espacial.")
-    parser.add_argument("--start_id", type=int, required=True,
-                        help="ID inicial esperado.")
-    parser.add_argument("--end_id", type=int, required=True,
-                        help="ID final esperado.")
-    parser.add_argument("--mission", type=str, required=True,
-                        help="Nombre de la misión, p.ej. ISS053, ISS067.")
+    parser.add_argument("--input_glob", type=str, default="*_real.points", help="Input glob inside input_folder")
+    parser.add_argument("--source_round_decimals", type=int, default=3, help="Decimals to group sourceX/sourceY tracks")
 
-    # Entrada / clave temporal
-    parser.add_argument("--input_glob", type=str, default="*_real.points",
-                        help="Patrón de entrada dentro de input_folder. Por defecto: *_real.points")
-    parser.add_argument("--source_round_decimals", type=int, default=3,
-                        help="Decimales para agrupar sourceX/sourceY como el mismo punto de rejilla.")
+    parser.add_argument("--disable_temporal", action="store_true", help="Disable temporal coherence")
+    parser.add_argument("--temporal_order", type=int, default=3, help="Temporal polynomial order")
+    parser.add_argument("--temporal_threshold_mode", choices=["sigma", "hybrid", "absolute"], default="sigma")
+    parser.add_argument("--temporal_sigma", type=float, default=2.0, help="Number of sigmas for temporal outlier detection")
+    parser.add_argument("--temporal_outlier_km", type=float, default=80.0, help="Absolute threshold for absolute/hybrid mode")
+    parser.add_argument("--temporal_min_threshold_km", type=float, default=0.0, help="Optional minimum temporal threshold")
+    parser.add_argument("--temporal_max_iter", type=int, default=4, help="Temporal fit/rejection iterations")
+    parser.add_argument("--min_track_points", type=int, default=6, help="Minimum observations to fit a track")
+    parser.add_argument("--min_track_coverage", type=float, default=0.20, help="Minimum track coverage to allow imputation")
+    parser.add_argument("--max_gap_frames", type=int, default=8, help="Maximum missing interior gap to fill; -1 allows any length")
+    parser.add_argument("--allow_extrapolation", action="store_true", help="Allow filling missing edge gaps")
+    parser.add_argument("--no_fill_missing", action="store_true", help="Do not fill absent frames; only correct observed outliers")
 
-    # Coherencia temporal
-    parser.add_argument("--disable_temporal", action="store_true",
-                        help="Desactiva ajuste temporal; deja solo filtrado espacial + renombrado.")
-    parser.add_argument("--temporal_order", type=int, default=3,
-                        help="Orden del polinomio temporal lat(t), lon(t). Recomendado: 2 o 3.")
-    parser.add_argument("--temporal_outlier_km", type=float, default=80.0,
-                        help="Umbral absoluto mínimo en km para declarar outlier temporal.")
-    parser.add_argument("--temporal_sigma", type=float, default=3.5,
-                        help="Umbral robusto: outlier si residuo > max(outlier_km, sigma*MAD).")
-    parser.add_argument("--temporal_min_scale_km", type=float, default=5.0,
-                        help="Escala robusta mínima en km para evitar umbrales demasiado pequeños.")
-    parser.add_argument("--temporal_max_iter", type=int, default=4,
-                        help="Iteraciones robustas máximas por track.")
-    parser.add_argument("--min_track_points", type=int, default=6,
-                        help="Mínimo de observaciones válidas para ajustar una trayectoria.")
-    parser.add_argument("--max_gap_frames", type=int, default=8,
-                        help="Máximo hueco interior a imputar. Usa -1 para huecos interiores ilimitados.")
-    parser.add_argument("--allow_extrapolation", action="store_true",
-                        help="Permite imputar fuera del rango observado bueno. Por defecto NO extrapola.")
-    parser.add_argument("--no_fill_missing", action="store_true",
-                        help="No añade puntos ausentes; solo sustituye observaciones malas si se pueden imputar.")
+    parser.add_argument("--pre_spatial_filter", action="store_true", help="Use BallTree before temporal fit")
+    parser.add_argument("--no_pre_spatial_filter", action="store_true", help="Compatibility flag: force no pre BallTree")
+    parser.add_argument("--no_post_spatial_filter", action="store_true", help="Disable final BallTree")
 
-    # Filtro espacial
-    parser.add_argument("--no_pre_spatial_filter", action="store_true",
-                        help="No usa BallTree antes del ajuste temporal para marcar puntos aislados como missing.")
-    parser.add_argument("--no_post_spatial_filter", action="store_true",
-                        help="No aplica BallTree final después de imputar.")
-
-    # QC / plots
-    parser.add_argument("--add_qc_columns", action="store_true",
-                        help="Añade columnas temporal_status/temporal_residual_km a los .points de salida.")
-    parser.add_argument("--plot_dir", type=str, default=None,
-                        help="Carpeta donde guardar plots de evolución temporal de puntos representativos.")
-    parser.add_argument("--max_plot_tracks", type=int, default=5,
-                        help="Número máximo de tracks representativos a plotear.")
-
+    parser.add_argument("--add_qc_columns", action="store_true", help="Add temporal QC columns to output .points")
+    parser.add_argument("--plot_dir", type=str, default=None, help="Folder for QC plots")
+    parser.add_argument("--image_dir", type=str, default=None, help="Pics folder for overlay plots")
+    parser.add_argument("--plot_reference_frames", type=str, default="", help="Overlay frames: first,mid,last or comma-separated indices")
+    parser.add_argument("--diagnostic_inset", type=float, default=0.25, help="Relative inset for internal diagnostic tracks")
+    parser.add_argument("--min_diagnostic_observations", type=int, default=20, help="Minimum observations for diagnostic tracks")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    pre_spatial = bool(args.pre_spatial_filter) and not bool(args.no_pre_spatial_filter)
+
     filter_and_rename_points(
         input_folder=args.input_folder,
         output_folder=args.output_folder,
@@ -1157,19 +1359,24 @@ def main() -> None:
         source_round_decimals=args.source_round_decimals,
         disable_temporal=args.disable_temporal,
         temporal_order=args.temporal_order,
+        temporal_threshold_mode=args.temporal_threshold_mode,
         temporal_outlier_km=args.temporal_outlier_km,
         temporal_sigma=args.temporal_sigma,
-        temporal_min_scale_km=args.temporal_min_scale_km,
+        temporal_min_threshold_km=args.temporal_min_threshold_km,
         temporal_max_iter=args.temporal_max_iter,
         min_track_points=args.min_track_points,
+        min_track_coverage=args.min_track_coverage,
         max_gap_frames=args.max_gap_frames,
         allow_extrapolation=args.allow_extrapolation,
         fill_missing=not args.no_fill_missing,
-        pre_spatial_filter=not args.no_pre_spatial_filter,
+        pre_spatial_filter=pre_spatial,
         post_spatial_filter=not args.no_post_spatial_filter,
         add_qc_columns=args.add_qc_columns,
         plot_dir=args.plot_dir,
-        max_plot_tracks=args.max_plot_tracks,
+        image_dir=args.image_dir,
+        plot_reference_frames=args.plot_reference_frames,
+        diagnostic_inset=args.diagnostic_inset,
+        min_diagnostic_observations=args.min_diagnostic_observations,
     )
 
 

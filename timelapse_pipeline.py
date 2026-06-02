@@ -302,7 +302,7 @@ def main():
     # Controles principales
     # ------------------------------------------------------------
 
-    use_angle_search = False
+    use_angle_search = True
     reuse_cached_angles = True
 
     rerun_simulation_if_exists = False
@@ -336,9 +336,9 @@ def main():
     # Parámetros de búsqueda de ángulos
     # ------------------------------------------------------------
 
-    yaw_range = (-20.0, 20.0)
-    pitch_range = (40.0, 70.0)
-    roll_range = (-15.0, 15.0)
+    yaw_range = (-180.0, 180.0)
+    pitch_range = (30.0, 90.0)
+    roll_range = (-45.0, 45.0)
 
     coarse_steps = (10.0, 5.0, 5.0)
 
@@ -893,18 +893,24 @@ def main():
                 sys.executable, "-m", "scripts_v3.filter_points",
                 "--input_folder", str(output_dir),
                 "--output_folder", str(filtered_points_dir),
-                "--radius_km", "40",
+                "--radius_km", "80",
                 "--start_id", str(start_id),
                 "--end_id", str(end_id),
                 "--mission", mission,
 
-                # NUEVO: coherencia temporal
                 "--temporal_order", "3",
-                "--temporal_outlier_km", "80",
-                "--temporal_sigma", "3.5",
+                "--temporal_threshold_mode", "sigma",
+                "--temporal_sigma", "3.0",
                 "--min_track_points", "6",
+                "--min_track_coverage", "0.20",
                 "--max_gap_frames", "8",
+
+                "--no_pre_spatial_filter",
+
                 "--plot_dir", str(base_dir / "temporal_qc_plots"),
+                "--image_dir", str(pics_dir),
+                "--plot_reference_frames", "first,mid,last",
+                "--diagnostic_inset", "0.25",
             ],
             check=True,
         )
