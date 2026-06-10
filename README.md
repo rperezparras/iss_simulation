@@ -1,4 +1,4 @@
-# iss_simulation_v3
+# iss_simulation
 # Pipeline de georreferenciación de imágenes nocturnas de la ISS
 
 Pipeline automatizada para georreferenciar timelapses nocturnos tomados desde la Estación Espacial Internacional (ISS), combinando:
