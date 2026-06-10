@@ -39,6 +39,25 @@ from pipelinentl.generate_timelapse import (
 from pipelinentl import generate_timelapse
 from pipelinentl import angle_search
 
+# ============================================================
+# RUTAS DEL PROYECTO
+# ============================================================
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+REPO_DIR = PACKAGE_DIR.parent
+
+# Por defecto apunta a /home/rpz/iss_simulation en tu estructura actual:
+# /home/rpz/iss_simulation/scripts_v3/pipelinentl/timelapse_pipeline.py
+DATA_ROOT = Path(
+    os.environ.get("ISS_SIMULATION_DATA_ROOT", PACKAGE_DIR.parents[1])
+).expanduser().resolve()
+
+
+def required_path(path: Path, label: str) -> Path:
+    path = Path(path).expanduser().resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"No se encontró {label}: {path}")
+    return path
 
 # ============================================================
 # HELPERS GENERALES
@@ -270,7 +289,7 @@ def main():
     start_id = 327041
     end_id = 328344
 
-    base_dir = Path(f"{mission}-E-{start_id}-{end_id}")
+    base_dir = DATA_ROOT / f"{mission}-E-{start_id}-{end_id}"
 
     pics_dir = base_dir / "pics"
     output_dir = base_dir / "output"
@@ -286,15 +305,17 @@ def main():
     corrected_points_dir = base_dir / "corrected_points"
     geo_corrected_dir = base_dir / "geo_corrected"
 
-    tle_dir = Path("/home/rpz/iss_simulation/ISS_tle")
-    texture_path = (
-        "/home/rpz/iss_simulation/"
-        "VNL_v2_npp_2020_global_vcmslcfg_c202102150000.median_masked.sqrt.full.40k_20k.png"
-    )
-    viirs_tiff_path = (
-        "/home/rpz/iss_simulation/"
-        "VNL_v2_npp_2021_global_vcmslcfg_c202203152300.median_masked.tif"
-    )
+    tle_dir = required_path(DATA_ROOT / "ISS_tle", "directorio de TLE")
+
+    texture_path = str(required_path(
+        DATA_ROOT / "VNL_v2_npp_2020_global_vcmslcfg_c202102150000.median_masked.sqrt.full.40k_20k.png",
+        "textura nocturna para Blender",
+    ))
+
+    viirs_tiff_path = str(required_path(
+        DATA_ROOT / "VNL_v2_npp_2021_global_vcmslcfg_c202203152300.median_masked.tif",
+        "mosaico VIIRS",
+    ))
 
     earth_radius = 10.0
 
