@@ -18,7 +18,7 @@ Para cada instante de tiempo:
 
 Uso típico desde la pipeline:
 
-    python -m scripts_v3.project_timelapse \
+    python -m pipelinentl.project_timelapse \
         --output_directory ... \
         --texture_path ... \
         --csv_dir ... \

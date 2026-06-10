@@ -8,9 +8,9 @@ from datetime import datetime, timezone, timedelta
 from skyfield.api import load
 from skyfield.framelib import itrs
 
-from scripts_v3.iss_simulation import list_tle_files, read_tle_from_files, find_closest_tle
+from pipelinentl.iss_simulation import list_tle_files, read_tle_from_files, find_closest_tle
 
-#ejecutar con: python -m scripts_v3.debug_forward_drift
+#ejecutar con: python -m pipelinentl.debug_forward_drift
 
 def neu_basis(lat_deg, lon_deg):
     lat = np.deg2rad(lat_deg)

@@ -4,10 +4,10 @@ Descarga imágenes de la ISS desde el servidor de NASA EOL, en un rango de IDs,
 con reintentos automáticos y soporte tanto como script CLI como módulo importable.
 
 Uso como script:
-    python -m scripts_v3.get_pics --mission ISS053 --start 462550 --end 462560 --output /ruta/a/pics
+    python -m pipelinentl.get_pics --mission ISS053 --start 462550 --end 462560 --output /ruta/a/pics
 
 Uso como módulo (por ejemplo desde la pipeline):
-    from scripts_v3 import get_pics
+    from pipelinentl import get_pics
     get_pics.download_all_images("ISS053", 462550, 462560, Path("/ruta/pics"))
 """
 
