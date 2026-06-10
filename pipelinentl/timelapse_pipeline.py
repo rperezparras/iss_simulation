@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pipeline completa timelapse ISS (scripts_v3) con recuperación robusta.
+Pipeline completa timelapse ISS (pipelinentl) con recuperación robusta.
 
 Pasos base:
 1) Descargar imágenes originales ISS.
@@ -31,13 +31,13 @@ from datetime import timedelta
 from argparse import Namespace
 import subprocess
 
-from scripts_v3.get_pics import download_all_images
-from scripts_v3.generate_timelapse import (
+from pipelinentl.get_pics import download_all_images
+from pipelinentl.generate_timelapse import (
     extract_exif_data,
     get_image_files,
 )
-from scripts_v3 import generate_timelapse
-from scripts_v3 import angle_search
+from pipelinentl import generate_timelapse
+from pipelinentl import angle_search
 
 
 # ============================================================
@@ -741,7 +741,7 @@ def main():
 
         subprocess.run(
             [
-                sys.executable, "-m", "scripts_v3.match_timelapse",
+                sys.executable, "-m", "pipelinentl.match_timelapse",
                 "--output_dir", str(output_dir),
                 "--pictures_dir", str(pics_dir),
                 "--matches_output_dir", str(matches_output_dir),
@@ -818,7 +818,7 @@ def main():
 
         subprocess.run(
             [
-                sys.executable, "-m", "scripts_v3.project_timelapse",
+                sys.executable, "-m", "pipelinentl.project_timelapse",
                 "--output_directory", str(output_dir),
                 "--texture_path", texture_path,
                 "--csv_dir", str(matches_output_dir),
@@ -890,7 +890,7 @@ def main():
 
         subprocess.run(
             [
-                sys.executable, "-m", "scripts_v3.filter_points",
+                sys.executable, "-m", "pipelinentl.filter_points",
                 "--input_folder", str(output_dir),
                 "--output_folder", str(filtered_points_dir),
                 "--radius_km", "80",
@@ -973,7 +973,7 @@ def main():
 
         subprocess.run(
             [
-                sys.executable, "-m", "scripts_v3.georef_timelapse",
+                sys.executable, "-m", "pipelinentl.georef_timelapse",
                 "--input_dir", str(pics_dir),
                 "--points_dir", str(filtered_points_dir),
                 "--output_dir", str(geo_dir),
@@ -1048,7 +1048,7 @@ def main():
 
         subprocess.run(
             [
-                sys.executable, "-m", "scripts_v3.viirs_roi_crop",
+                sys.executable, "-m", "pipelinentl.viirs_roi_crop",
                 "--geo_dir", str(geo_dir),
                 "--viirs_tiff", str(viirs_tiff_path),
                 "--output_dir", str(viirs_output_dir),
@@ -1119,7 +1119,7 @@ def main():
 
         subprocess.run(
             [
-                sys.executable, "-m", "scripts_v3.optical_flow",
+                sys.executable, "-m", "pipelinentl.optical_flow",
                 "--geo_dir", str(geo_dir),
                 "--viirs_dir", str(viirs_output_dir),
                 "--flow_dir", str(flow_dir),
@@ -1187,7 +1187,7 @@ def main():
 
         subprocess.run(
             [
-                sys.executable, "-m", "scripts_v3.correct_points",
+                sys.executable, "-m", "pipelinentl.correct_points",
                 "--input_points_dir", str(filtered_points_dir),
                 "--flow_dir", str(flow_dir),
                 "--geo_dir", str(geo_dir),
@@ -1252,7 +1252,7 @@ def main():
 
             subprocess.run(
                 [
-                    sys.executable, "-m", "scripts_v3.georef_timelapse",
+                    sys.executable, "-m", "pipelinentl.georef_timelapse",
                     "--input_dir", str(pics_dir),
                     "--points_dir", str(corrected_points_dir),
                     "--output_dir", str(geo_corrected_dir),
@@ -1320,7 +1320,7 @@ def main():
                 print(f"   - Georreferenciando muestra ID {sid}")
                 subprocess.run(
                     [
-                        sys.executable, "-m", "scripts_v3.georef_timelapse",
+                        sys.executable, "-m", "pipelinentl.georef_timelapse",
                         "--input_dir", str(pics_dir),
                         "--points_dir", str(corrected_points_dir),
                         "--output_dir", str(geo_corrected_dir),

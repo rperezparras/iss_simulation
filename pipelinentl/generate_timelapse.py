@@ -4,7 +4,7 @@ Generación de timelapse simulado de la ISS a partir de imágenes reales (pics).
 
 Uso típico como script:
 
-    python -m scripts_v3.generate_timelapse \
+    python -m pipelinentl.generate_timelapse \
         --pics /ruta/a/pics \
         --output /ruta/a/output \
         --tle /ruta/a/ISS_tle \
@@ -15,7 +15,7 @@ Uso típico como script:
 
 También puede usarse en modo test (solo primer fotograma):
 
-    python -m scripts_v3.generate_timelapse --pics ... --output ... --test
+    python -m pipelinentl.generate_timelapse --pics ... --output ... --test
 
 Y desde la pipeline, llamando a main(Args) donde Args es un Namespace.
 """
