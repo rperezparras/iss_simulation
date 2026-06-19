@@ -31,6 +31,9 @@ from datetime import timedelta
 from argparse import Namespace
 import subprocess
 
+import cv2
+import numpy as np
+
 from pipelinentl.get_pics import download_all_images
 from pipelinentl.generate_timelapse import (
     extract_exif_data,
@@ -276,6 +279,201 @@ def geo_file_for_id_exists(folder: Path, sid: int) -> bool:
     return any(p.is_file() and p.stat().st_size > 0 for p in matches)
 
 
+
+# ============================================================
+# HELPERS PARA ELEGIR FRAME DE REFERENCIA DE ANGLE_SEARCH
+# ============================================================
+
+def _unique_candidate_indices(n_images: int, fractions) -> list[int]:
+    """
+    Devuelve índices únicos dentro del timelapse a partir de fracciones.
+
+    Ejemplo con las fracciones por defecto:
+      0.0 -> primera imagen
+      1/3 -> imagen aproximadamente al primer tercio
+      0.5 -> imagen central
+      2/3 -> imagen aproximadamente al segundo tercio
+      1.0 -> última imagen
+    """
+    if n_images <= 0:
+        return []
+
+    indices = []
+    for frac in fractions:
+        frac = max(0.0, min(1.0, float(frac)))
+        idx = int(round(frac * (n_images - 1)))
+        idx = max(0, min(n_images - 1, idx))
+        indices.append(idx)
+
+    out = []
+    seen = set()
+    for idx in indices:
+        if idx not in seen:
+            out.append(idx)
+            seen.add(idx)
+
+    return out
+
+
+def _score_reference_image_for_angle_search(
+    image_path: Path,
+    coverage_bins: int = 6,
+    work_max_side: int = 1600,
+) -> dict:
+    """
+    Puntúa una imagen real para decidir si es buena referencia para angle_search.
+
+    Es una evaluación barata: no renderiza Blender ni hace matching contra una
+    simulación. Solo mira si la imagen real tiene señal suficiente y estructura
+    espacial para que luego el matching del angle_search tenga más probabilidad
+    de funcionar.
+    """
+    img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        return {
+            "score": -1.0e9,
+            "n_keypoints": 0,
+            "coverage": 0.0,
+            "contrast": 0.0,
+            "texture": 0.0,
+            "non_dark_fraction": 0.0,
+        }
+
+    h, w = img_bgr.shape[:2]
+    max_side = max(h, w)
+
+    if max_side > work_max_side:
+        scale = float(work_max_side) / float(max_side)
+        new_w = max(32, int(round(w * scale)))
+        new_h = max(32, int(round(h * scale)))
+        img_bgr = cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        h, w = img_bgr.shape[:2]
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+    # Señal luminosa mínima. Penaliza frames casi negros o con muy poca tierra visible.
+    non_dark_mask = gray > 10
+    non_dark_fraction = float(np.mean(non_dark_mask))
+
+    # Contraste global y textura local.
+    contrast = float(np.std(gray))
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    texture = float(np.var(lap))
+
+    # Keypoints ORB: proxy barato de si habrá estructura útil para matching.
+    orb = cv2.ORB_create(nfeatures=8000, fastThreshold=7)
+    keypoints = orb.detect(gray, None)
+    n_keypoints = len(keypoints)
+
+    if n_keypoints > 0:
+        pts = np.array([kp.pt for kp in keypoints], dtype=np.float32)
+        xs = np.clip((pts[:, 0] / max(w, 1) * coverage_bins).astype(int), 0, coverage_bins - 1)
+        ys = np.clip((pts[:, 1] / max(h, 1) * coverage_bins).astype(int), 0, coverage_bins - 1)
+        occupied = {(int(x), int(y)) for x, y in zip(xs, ys)}
+        coverage = float(len(occupied)) / float(coverage_bins * coverage_bins)
+    else:
+        coverage = 0.0
+
+    keypoint_score = float(np.tanh(n_keypoints / 1000.0))
+    contrast_score = float(np.clip(contrast / 64.0, 0.0, 1.0))
+    texture_score = float(np.clip(np.log1p(texture) / np.log1p(2000.0), 0.0, 1.0))
+    non_dark_score = float(np.clip(non_dark_fraction / 0.35, 0.0, 1.0))
+
+    penalty = 0.0
+    if non_dark_fraction < 0.01:
+        penalty += 1.0
+    if n_keypoints < 100:
+        penalty += 1.0
+    if coverage < 0.10:
+        penalty += 0.5
+
+    score = (
+        2.00 * coverage
+        + 1.50 * keypoint_score
+        + 0.50 * contrast_score
+        + 0.50 * texture_score
+        + 0.35 * non_dark_score
+        - penalty
+    )
+
+    return {
+        "score": float(score),
+        "n_keypoints": int(n_keypoints),
+        "coverage": float(coverage),
+        "contrast": float(contrast),
+        "texture": float(texture),
+        "non_dark_fraction": float(non_dark_fraction),
+    }
+
+
+def select_angle_search_reference_frame(
+    pics_dir: Path,
+    image_files,
+    start_dt,
+    delta: float,
+    reference_fractions=(0.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0),
+):
+    """
+    Elige automáticamente qué frame del timelapse usar como referencia para
+    angle_search.
+
+    Devuelve:
+      real_image_path, obs_time, reference_info
+    """
+    pics_dir = Path(pics_dir)
+    image_files = list(image_files)
+
+    if not image_files:
+        raise RuntimeError("No hay imágenes para elegir referencia de angle_search.")
+
+    candidate_indices = _unique_candidate_indices(
+        n_images=len(image_files),
+        fractions=reference_fractions,
+    )
+
+    print("Evaluando frames candidatos para angle_search:")
+    print("   índice | imagen | score | keypoints | coverage | contrast | non_dark")
+
+    candidates = []
+
+    for idx in candidate_indices:
+        image_name = image_files[idx]
+        image_path = pics_dir / image_name
+        metrics = _score_reference_image_for_angle_search(image_path)
+        obs_time = start_dt + timedelta(seconds=float(delta) * float(idx))
+
+        info = {
+            "reference_index": int(idx),
+            "reference_image_name": str(image_name),
+            "reference_image_path": str(image_path),
+            "reference_obs_time": obs_time.isoformat(),
+            "reference_score": float(metrics["score"]),
+            **metrics,
+        }
+        candidates.append(info)
+
+        print(
+            f"   {idx:5d} | {image_name} | "
+            f"{metrics['score']:.4f} | "
+            f"{metrics['n_keypoints']:6d} | "
+            f"{metrics['coverage']:.3f} | "
+            f"{metrics['contrast']:.2f} | "
+            f"{metrics['non_dark_fraction']:.3f}"
+        )
+
+    best = max(candidates, key=lambda d: float(d["reference_score"]))
+
+    print("Frame elegido para angle_search:")
+    print(f"   index = {best['reference_index']}")
+    print(f"   image = {best['reference_image_name']}")
+    print(f"   obs_time = {best['reference_obs_time']}")
+    print(f"   reference_score = {best['reference_score']:.4f}")
+
+    real_image_path = Path(best["reference_image_path"])
+    obs_time = start_dt + timedelta(seconds=float(delta) * float(best["reference_index"]))
+
+    return real_image_path, obs_time, best
+
 # ============================================================
 # PIPELINE
 # ============================================================
@@ -286,8 +484,8 @@ def main():
     # ============================================================
 
     mission = "ISS067"
-    start_id = 327041
-    end_id = 328344
+    start_id = 362508 
+    end_id = 363421
 
     base_dir = DATA_ROOT / f"{mission}-E-{start_id}-{end_id}"
 
@@ -374,11 +572,23 @@ def main():
     sensor_height = 28.0
 
     # Parámetros matching
+    # Parámetros matching
     matching_grid_step = 185
     matching_show_every = 50
     matching_min_grid_points = 30
     matching_plot_max_matches = 150
-    min_matching_success_ratio = 0.95
+
+    # Mínimo DURO para continuar.
+    # En timelapses con mucho mar/nubes no tiene sentido exigir 95%.
+    # La pipeline continuará si hay al menos:
+    #   max(matching_min_success_count_to_continue,
+    #       matching_min_success_ratio_to_continue * n_images)
+    # CSVs válidos.
+    matching_min_success_ratio_to_continue = 0.20
+    matching_min_success_count_to_continue = 50
+
+    # Umbral recomendado solo para aviso, no para parar.
+    matching_warning_success_ratio = 0.95
 
     # Parámetros filter_points
     filter_radius_km = 80
@@ -484,6 +694,8 @@ def main():
     print(f"  n_images = {n_images}")
     print(f"  delta    = {delta:.6f} s")
 
+    angle_reference_info = None
+
     # ============================================================
     # 4. BÚSQUEDA DE YAW/PITCH/ROLL
     # ============================================================
@@ -508,14 +720,45 @@ def main():
                 pitch = float(cached.get("pitch"))
                 roll = float(cached.get("roll"))
 
-                print(f"   yaw   = {yaw}")
-                print(f"   pitch = {pitch}")
-                print(f"   roll  = {roll}")
+                # Si el cache es antiguo y no guarda la imagen de referencia,
+                # recalculamos para aplicar el nuevo criterio de selección.
+                cache_has_reference = (
+                    "reference_image" in cached
+                    and "reference_index" in cached
+                    and "reference_obs_time" in cached
+                )
 
-                if "score" in cached:
-                    print(f"   score = {cached['score']}")
+                if not cache_has_reference:
+                    print(
+                        "AVISO: el cache de angle_search no tiene información "
+                        "del frame de referencia. Se recalculará."
+                    )
+                    cache_file.unlink(missing_ok=True)
+                    reuse_from_cache = False
+                else:
+                    print(f"   yaw   = {yaw}")
+                    print(f"   pitch = {pitch}")
+                    print(f"   roll  = {roll}")
 
-                reuse_from_cache = True
+                    if "score" in cached:
+                        print(f"   score = {cached['score']}")
+
+                    print(f"   reference_image = {cached['reference_image']}")
+                    print(f"   reference_index = {cached['reference_index']}")
+                    print(f"   reference_obs_time = {cached['reference_obs_time']}")
+
+                    if "reference_score" in cached:
+                        print(f"   reference_score = {cached['reference_score']}")
+
+                    angle_reference_info = {
+                        "reference_image": cached.get("reference_image"),
+                        "reference_index": cached.get("reference_index"),
+                        "reference_obs_time": cached.get("reference_obs_time"),
+                        "reference_score": cached.get("reference_score"),
+                        "reference_keypoints": cached.get("reference_keypoints"),
+                        "reference_coverage": cached.get("reference_coverage"),
+                    }
+                    reuse_from_cache = True
 
             except Exception as e:
                 print(f"AVISO: error leyendo cache de ángulos ({e}). Se recalculará.")
@@ -524,15 +767,30 @@ def main():
 
         if not reuse_from_cache:
             print(f"[{step}/{total_steps}] Buscando yaw/pitch/roll óptimos con angle_search...")
-            real_image_path = pics_dir / first_img
-            obs_time = start_dt
 
             search_output_dir.mkdir(parents=True, exist_ok=True)
+
+            # En vez de usar siempre la primera imagen, se evalúan varias
+            # candidatas del timelapse: primera, 1/3, 1/2, 2/3 y última.
+            # Solo cambia la imagen de referencia; la búsqueda de yaw/pitch/roll
+            # sigue haciéndola angle_search.search_best_yaw_pitch_roll.
+            real_image_path, obs_time, reference_info = select_angle_search_reference_frame(
+                pics_dir=pics_dir,
+                image_files=img_files,
+                start_dt=start_dt,
+                delta=delta,
+                reference_fractions=(0.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0),
+            )
+
+            reference_search_output_dir = (
+                search_output_dir / f"ref_{reference_info['reference_index']:05d}"
+            )
+            reference_search_output_dir.mkdir(parents=True, exist_ok=True)
 
             best_angles, search_details = angle_search.search_best_yaw_pitch_roll(
                 real_image_path=str(real_image_path),
                 obs_time=obs_time,
-                search_output_dir=str(search_output_dir),
+                search_output_dir=str(reference_search_output_dir),
                 tle_dir=str(tle_dir),
                 texture_path=texture_path,
 
@@ -562,11 +820,28 @@ def main():
                 roll = float(best_angles["roll"])
                 score = best_angles.get("score", None)
 
+                # Guardamos en el resultado qué frame se usó para la búsqueda.
+                best_angles.update(reference_info)
+                angle_reference_info = {
+                    "reference_image": reference_info["reference_image_name"],
+                    "reference_index": reference_info["reference_index"],
+                    "reference_obs_time": reference_info["reference_obs_time"],
+                    "reference_score": reference_info["reference_score"],
+                    "reference_keypoints": reference_info["n_keypoints"],
+                    "reference_coverage": reference_info["coverage"],
+                }
+
                 print("Mejores ángulos encontrados:")
                 print(f"   yaw   = {yaw}")
                 print(f"   pitch = {pitch}")
                 print(f"   roll  = {roll}")
                 print(f"   score = {score}")
+                print(f"   reference_image = {reference_info['reference_image_name']}")
+                print(f"   reference_index = {reference_info['reference_index']}")
+                print(f"   reference_obs_time = {reference_info['reference_obs_time']}")
+                print(f"   reference_score = {reference_info['reference_score']:.4f}")
+                print(f"   reference_keypoints = {reference_info['n_keypoints']}")
+                print(f"   reference_coverage = {reference_info['coverage']:.4f}")
 
                 with cache_file.open("w", encoding="utf-8") as f:
                     f.write(f"yaw={yaw}\n")
@@ -574,6 +849,13 @@ def main():
                     f.write(f"roll={roll}\n")
                     if score is not None:
                         f.write(f"score={score}\n")
+
+                    f.write(f"reference_image={reference_info['reference_image_name']}\n")
+                    f.write(f"reference_index={reference_info['reference_index']}\n")
+                    f.write(f"reference_obs_time={reference_info['reference_obs_time']}\n")
+                    f.write(f"reference_score={reference_info['reference_score']}\n")
+                    f.write(f"reference_keypoints={reference_info['n_keypoints']}\n")
+                    f.write(f"reference_coverage={reference_info['coverage']}\n")
 
                 summary_json = base_dir / "angle_search_best_result.json"
                 try:
@@ -622,6 +904,7 @@ def main():
         "pitch": pitch,
         "roll": roll,
         "orientation_mode": orientation_mode,
+        "angle_reference_info": angle_reference_info,
         "texture_path": texture_path,
         "tle_dir": str(tle_dir),
     }
@@ -641,16 +924,92 @@ def main():
     }
     sim_config_file = output_dir / "_render_config.json"
 
-    run_simulation = step_should_run(
-        folder=output_dir,
-        pattern="render_output_*.png",
-        expected=n_images,
-        label="renders simulados",
-        config_file=sim_config_file,
-        current_config=sim_config,
-        force_downstream=force_downstream,
-        force_this_step=rerun_simulation_if_exists,
-    )
+    # Para la simulación no usamos configs_equal() a pelo, porque es demasiado
+    # estricta: puede forzar rerender por cambios irrelevantes en el JSON.
+    # Solo rerenderizamos si cambian parámetros que realmente modifican los renders.
+    existing_render_count = count_nonempty(output_dir, "render_output_*.png")
+
+    if existing_render_count >= n_images and not rerun_simulation_if_exists:
+        old_sim_config = read_json(sim_config_file)
+
+        keys_that_require_rerender = [
+            "mission",
+            "start_id",
+            "end_id",
+            "n_images",
+            "start_dt",
+            "end_dt",
+            "delta",
+            "focal_length",
+            "sensor_width",
+            "sensor_height",
+            "pixel_width",
+            "pixel_height",
+            "earth_radius",
+            "yaw",
+            "pitch",
+            "roll",
+            "orientation_mode",
+            "texture_path",
+            "tle_dir",
+        ]
+
+        changed_keys = []
+
+        if old_sim_config is None:
+            print(
+                f"   OK renders simulados: ya existen {existing_render_count}/{n_images}. "
+                "Falta _render_config.json, se reutilizan y se escribe la config actual."
+            )
+            run_simulation = False
+            write_json(sim_config_file, sim_config)
+
+        else:
+            for k in keys_that_require_rerender:
+                old_v = old_sim_config.get(k)
+                new_v = sim_config.get(k)
+
+                # Comparación tolerante para floats.
+                if isinstance(old_v, (float, int)) or isinstance(new_v, (float, int)):
+                    try:
+                        same = abs(float(old_v) - float(new_v)) < 1e-6
+                    except Exception:
+                        same = old_v == new_v
+                else:
+                    same = old_v == new_v
+
+                if not same:
+                    changed_keys.append((k, old_v, new_v))
+
+            if changed_keys:
+                print("   AVISO renders simulados: cambió configuración geométrica real.")
+                print("   Claves que fuerzan rerender:")
+                for k, old_v, new_v in changed_keys:
+                    print(f"      {k}: {old_v!r} -> {new_v!r}")
+
+                run_simulation = True
+
+            else:
+                print(
+                    f"   OK renders simulados: completos ({existing_render_count}/{n_images}) "
+                    "y configuración geométrica compatible. Se reutilizan."
+                )
+                run_simulation = False
+
+                # Actualizamos el JSON para evitar futuros falsos positivos.
+                write_json(sim_config_file, sim_config)
+
+    else:
+        run_simulation = step_should_run(
+            folder=output_dir,
+            pattern="render_output_*.png",
+            expected=n_images,
+            label="renders simulados",
+            config_file=sim_config_file,
+            current_config=sim_config,
+            force_downstream=force_downstream,
+            force_this_step=rerun_simulation_if_exists,
+        )
 
     if run_simulation:
         existing_render_count = count_nonempty(output_dir, "render_output_*.png")
@@ -704,6 +1063,10 @@ def main():
 
     matches_output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Configuración que SÍ afecta al resultado del matching.
+    # Importante: no metemos aquí los umbrales de aceptación de la pipeline,
+    # porque cambiar un umbral de "continuar/no continuar" no debería obligar
+    # a recalcular todos los matches.
     match_config = {
         **common_config,
         "step": "match_timelapse",
@@ -711,30 +1074,76 @@ def main():
         "matching_show_every": matching_show_every,
         "matching_min_grid_points": matching_min_grid_points,
         "matching_plot_max_matches": matching_plot_max_matches,
-        "min_matching_success_ratio": min_matching_success_ratio,
         "match_timelapse_version": "ransac_normalized_poly_grid_visualization_v1",
     }
     match_config_file = matches_output_dir / "_match_config.json"
 
     n_existing_csv = count_nonempty(matches_output_dir, "transformed_coordinates_*.csv")
-    min_csv = max(1, math.ceil(min_matching_success_ratio * n_images))
+
+    # Umbral duro: por debajo de esto sí paramos, porque no hay suficiente material.
+    min_csv_hard = min(
+        n_images,
+        max(
+            1,
+            int(matching_min_success_count_to_continue),
+            math.ceil(float(matching_min_success_ratio_to_continue) * n_images),
+        ),
+    )
+
+    # Umbral recomendado: solo avisa.
+    min_csv_warning = min(
+        n_images,
+        max(
+            1,
+            math.ceil(float(matching_warning_success_ratio) * n_images),
+        ),
+    )
 
     old_match_config = read_json(match_config_file)
-    match_outputs_ok = n_existing_csv >= min_csv
+
+    # Compatibilidad con configs antiguas que tenían min_matching_success_ratio.
+    # Ese parámetro no afecta a los CSV generados, solo a si la pipeline paraba.
+    if old_match_config is not None:
+        old_match_config_comparable = dict(old_match_config)
+        old_match_config_comparable.pop("min_matching_success_ratio", None)
+        old_match_config_comparable.pop("matching_min_success_ratio_to_continue", None)
+        old_match_config_comparable.pop("matching_min_success_count_to_continue", None)
+        old_match_config_comparable.pop("matching_warning_success_ratio", None)
+    else:
+        old_match_config_comparable = None
+
+    match_outputs_ok = n_existing_csv >= min_csv_hard
+
+    print(
+        f"   CSVs de matching existentes: {n_existing_csv}/{n_images} "
+        f"({100 * n_existing_csv / max(n_images, 1):.1f}%)."
+    )
+    print(
+        f"   Mínimo duro para continuar: {min_csv_hard}/{n_images} "
+        f"({100 * min_csv_hard / max(n_images, 1):.1f}%)."
+    )
+    print(
+        f"   Umbral recomendado: {min_csv_warning}/{n_images} "
+        f"({100 * min_csv_warning / max(n_images, 1):.1f}%)."
+    )
 
     if rerun_matching_if_exists:
         print("   AVISO matching: forzado por configuración.")
         run_matching = True
+
     elif force_downstream:
         print("   AVISO matching: se recalculará porque un paso anterior cambió.")
         run_matching = True
+
     elif not match_outputs_ok:
         print(
-            f"   AVISO CSVs de matching: insuficientes "
-            f"({n_existing_csv}/{n_images}). Mínimo requerido: {min_csv}."
+            f"   AVISO CSVs de matching: insuficientes para continuar "
+            f"({n_existing_csv}/{n_images}). "
+            f"Mínimo duro requerido: {min_csv_hard}."
         )
         run_matching = True
-    elif old_match_config is None:
+
+    elif old_match_config_comparable is None:
         print(
             f"   AVISO CSVs de matching: suficientes "
             f"({n_existing_csv}/{n_images}), pero falta config. "
@@ -742,12 +1151,14 @@ def main():
         )
         write_json(match_config_file, match_config)
         run_matching = False
-    elif not configs_equal(old_match_config, match_config):
-        print("   AVISO matching: configuración distinta. Se recalculará.")
+
+    elif not configs_equal(old_match_config_comparable, match_config):
+        print("   AVISO matching: configuración que afecta al matching distinta. Se recalculará.")
         run_matching = True
+
     else:
         print(
-            f"   OK CSVs de matching suficientes: "
+            f"   OK CSVs de matching suficientes para continuar: "
             f"{n_existing_csv}/{n_images} "
             f"({100 * n_existing_csv / n_images:.1f}%)."
         )
@@ -776,14 +1187,23 @@ def main():
 
         n_csv = count_nonempty(matches_output_dir, "transformed_coordinates_*.csv")
 
-        if n_csv < min_csv:
+        if n_csv < min_csv_hard:
             raise RuntimeError(
-                f"match_timelapse terminó, pero hay pocos CSVs válidos: "
-                f"{n_csv}/{n_images}. Mínimo requerido: {min_csv} "
-                f"({100 * min_matching_success_ratio:.1f}%)."
+                f"match_timelapse terminó, pero hay demasiado pocos CSVs válidos: "
+                f"{n_csv}/{n_images}. "
+                f"Mínimo duro requerido: {min_csv_hard} "
+                f"({100 * min_csv_hard / max(n_images, 1):.1f}%)."
             )
 
-        if n_csv < n_images:
+        if n_csv < min_csv_warning:
+            print(
+                f"   AVISO: hay menos CSVs válidos que el umbral recomendado "
+                f"({n_csv}/{n_images}, {100 * n_csv / n_images:.1f}%). "
+                f"Recomendado: {min_csv_warning}/{n_images} "
+                f"({100 * matching_warning_success_ratio:.1f}%). "
+                "La pipeline continuará con los frames válidos."
+            )
+        elif n_csv < n_images:
             print(
                 f"   AVISO: faltan algunos CSVs de matching "
                 f"({n_csv}/{n_images}, {100 * n_csv / n_images:.1f}%). "
@@ -798,12 +1218,19 @@ def main():
     n_valid_csv = count_nonempty(matches_output_dir, "transformed_coordinates_*.csv")
     print(f"   Frames con CSV de matching válido: {n_valid_csv}/{n_images}")
 
-    if n_valid_csv < min_csv:
+    if n_valid_csv < min_csv_hard:
         raise RuntimeError(
             f"No hay suficientes CSVs válidos para continuar: "
-            f"{n_valid_csv}/{n_images}. Mínimo requerido: {min_csv}."
+            f"{n_valid_csv}/{n_images}. "
+            f"Mínimo duro requerido: {min_csv_hard}."
         )
 
+    if n_valid_csv < min_csv_warning:
+        print(
+            f"   AVISO: se continuará aunque el porcentaje de matching válido sea bajo "
+            f"({100 * n_valid_csv / n_images:.1f}%). "
+            "Esto es esperable en timelapses con mucho mar, nubes o frames pobres."
+        )
     # ============================================================
     # 7. PROYECCIÓN DE PÍXELES -> .points
     # ============================================================
@@ -918,6 +1345,8 @@ def main():
                 "--start_id", str(start_id),
                 "--end_id", str(end_id),
                 "--mission", mission,
+
+                "--disable_temporal",
 
                 "--temporal_order", "3",
                 "--temporal_threshold_mode", "sigma",
