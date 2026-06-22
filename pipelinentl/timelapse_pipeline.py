@@ -28,19 +28,16 @@ import math
 import re
 from pathlib import Path
 from datetime import timedelta
+import argparse
 from argparse import Namespace
 import subprocess
 
-import cv2
-import numpy as np
-
-from pipelinentl.get_pics import download_all_images
-from pipelinentl.generate_timelapse import (
-    extract_exif_data,
-    get_image_files,
-)
-from pipelinentl import generate_timelapse
-from pipelinentl import angle_search
+# Imports pesados (cv2, numpy, Blender/bpy via generate_timelapse y
+# angle_search) se cargan dentro de main(), después de parsear argumentos.
+# Así `python -m pipelinentl.timelapse_pipeline --help` no necesita inicializar
+# OpenCV, NumPy ni Blender.
+cv2 = None
+np = None
 
 # ============================================================
 # RUTAS DEL PROYECTO
@@ -49,8 +46,8 @@ from pipelinentl import angle_search
 PACKAGE_DIR = Path(__file__).resolve().parent
 REPO_DIR = PACKAGE_DIR.parent
 
-# Por defecto apunta a /home/rpz/iss_simulation en tu estructura actual:
-# /home/rpz/iss_simulation/scripts_v3/pipelinentl/timelapse_pipeline.py
+# Raiz por defecto para datos externos grandes. Puede sobrescribirse con
+# ISS_SIMULATION_DATA_ROOT o con el argumento --data-root.
 DATA_ROOT = Path(
     os.environ.get("ISS_SIMULATION_DATA_ROOT", PACKAGE_DIR.parents[1])
 ).expanduser().resolve()
@@ -474,20 +471,196 @@ def select_angle_search_reference_frame(
 
     return real_image_path, obs_time, best
 
+
+# ============================================================
+# CONFIGURACION CLI
+# ============================================================
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Pipeline completa de georreferenciacion de timelapses ISS.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    g = parser.add_argument_group("Experimento y datos")
+    g.add_argument("--mission", default="ISS067", help="Mision ISS, por ejemplo ISS067.")
+    g.add_argument("--start-id", dest="start_id", type=int, default=362508, help="ID inicial de imagen.")
+    g.add_argument("--end-id", dest="end_id", type=int, default=363421, help="ID final de imagen.")
+    g.add_argument(
+        "--data-root",
+        dest="data_root",
+        default=str(DATA_ROOT),
+        help=(
+            "Raiz donde estan los datos grandes: ISS_tle, texturas VIIRS y "
+            "carpetas ISSxxx-E-start-end. Tambien puede definirse con "
+            "ISS_SIMULATION_DATA_ROOT."
+        ),
+    )
+    g.add_argument(
+        "--base-dir",
+        dest="base_dir",
+        default=None,
+        help="Carpeta concreta del experimento. Si se omite: <data-root>/<mission>-E-<start>-<end>.",
+    )
+    g.add_argument("--tle-dir", dest="tle_dir", default=None, help="Directorio con TLEs. Si se omite: <data-root>/ISS_tle.")
+    g.add_argument(
+        "--texture-path",
+        dest="texture_path",
+        default=None,
+        help="Textura nocturna para Blender. Si se omite se busca en <data-root>.",
+    )
+    g.add_argument(
+        "--viirs-tiff-path",
+        dest="viirs_tiff_path",
+        default=None,
+        help="Mosaico VIIRS GeoTIFF. Si se omite se busca en <data-root>.",
+    )
+
+    g = parser.add_argument_group("Control de ejecucion")
+    g.add_argument("--angle-search", dest="use_angle_search", action=argparse.BooleanOptionalAction, default=True)
+    g.add_argument("--reuse-cached-angles", dest="reuse_cached_angles", action=argparse.BooleanOptionalAction, default=True)
+    g.add_argument("--optical-flow", dest="use_optical_flow", action=argparse.BooleanOptionalAction, default=True)
+    g.add_argument("--second-georef-mode", choices=["none", "full", "sample"], default="sample")
+    g.add_argument("--second-georef-samples", type=int, default=10, help="Numero de muestras si second_georef_mode=sample.")
+
+    g.add_argument("--rerun-simulation", dest="rerun_simulation_if_exists", action="store_true")
+    g.add_argument("--rerun-matching", dest="rerun_matching_if_exists", action="store_true")
+    g.add_argument("--rerun-projection", dest="rerun_projection_if_exists", action="store_true")
+    g.add_argument("--rerun-filtering", dest="rerun_filtering_if_exists", action="store_true")
+    g.add_argument("--rerun-first-georef", dest="rerun_first_georef_if_exists", action="store_true")
+    g.add_argument("--rerun-viirs", dest="rerun_viirs_if_exists", action="store_true")
+    g.add_argument("--rerun-optical-flow", dest="rerun_optical_flow_if_exists", action="store_true")
+    g.add_argument("--rerun-correct-points", dest="rerun_correct_points_if_exists", action="store_true")
+    g.add_argument("--rerun-second-georef", dest="rerun_second_georef_if_exists", action="store_true")
+
+    g = parser.add_argument_group("Camara, tiempo y orientacion")
+    g.add_argument("--yaw", type=float, default=12.5, help="Yaw fallback si angle_search esta desactivado o falla.")
+    g.add_argument("--pitch", type=float, default=63.5, help="Pitch fallback si angle_search esta desactivado o falla.")
+    g.add_argument("--roll", type=float, default=-1.0, help="Roll fallback si angle_search esta desactivado o falla.")
+    g.add_argument("--orientation-mode", choices=["north", "forward"], default="forward")
+    g.add_argument("--time-offset-seconds", type=float, default=0.0)
+    g.add_argument("--time-offset-minutes", type=float, default=0.0)
+    g.add_argument("--time-offset-hours", type=float, default=0.0)
+    g.add_argument("--sensor-width", type=float, default=36.0)
+    g.add_argument("--sensor-height", type=float, default=28.0)
+    g.add_argument("--earth-radius", type=float, default=10.0)
+
+    g = parser.add_argument_group("Busqueda de angulos")
+    g.add_argument("--yaw-range", nargs=2, type=float, default=(-180.0, 180.0), metavar=("MIN", "MAX"))
+    g.add_argument("--pitch-range", nargs=2, type=float, default=(30.0, 90.0), metavar=("MIN", "MAX"))
+    g.add_argument("--roll-range", nargs=2, type=float, default=(-45.0, 45.0), metavar=("MIN", "MAX"))
+    g.add_argument("--coarse-steps", nargs=3, type=float, default=(10.0, 5.0, 5.0), metavar=("YAW", "PITCH", "ROLL"))
+    g.add_argument("--fine-steps", nargs=3, type=float, default=(2.5, 1.5, 1.0), metavar=("YAW", "PITCH", "ROLL"))
+    g.add_argument("--fine-windows", nargs=3, type=float, default=(5.0, 4.0, 3.0), metavar=("YAW", "PITCH", "ROLL"))
+    g.add_argument("--refine-steps", nargs=3, type=float, default=(1.0, 0.5, 0.5), metavar=("YAW", "PITCH", "ROLL"))
+    g.add_argument("--refine-windows", nargs=3, type=float, default=(2.0, 1.0, 1.0), metavar=("YAW", "PITCH", "ROLL"))
+    g.add_argument("--angle-reference-fractions", nargs="+", type=float, default=(0.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0))
+    g.add_argument("--simplex-max-iter", type=int, default=45)
+    g.add_argument("--simplex-max-evals", type=int, default=140)
+    g.add_argument("--simplex-score-tol", type=float, default=1e-3)
+
+    g = parser.add_argument_group("Backend de matching")
+    g.add_argument("--matcher-backend", choices=["auto", "vismatch", "matching", "none"], default="auto")
+    g.add_argument("--matcher-model", default=None, help="Modelo de matching. Por defecto depende del backend.")
+    g.add_argument("--matching-repo", default=None, help="Repo local opcional de vismatch o image-matching-models legacy.")
+    g.add_argument("--matcher-device", choices=["cpu", "cuda"], default=None)
+    g.add_argument("--no-orb-fallback", action="store_true", help="Desactiva ORB fallback si falla el matcher neural.")
+
+    g = parser.add_argument_group("Matching real-simulada")
+    g.add_argument("--matching-grid-step", type=int, default=185)
+    g.add_argument("--matching-show-every", type=int, default=50)
+    g.add_argument("--matching-min-grid-points", type=int, default=30)
+    g.add_argument("--matching-plot-max-matches", type=int, default=150)
+    g.add_argument("--matching-min-success-ratio-to-continue", type=float, default=0.20)
+    g.add_argument("--matching-min-success-count-to-continue", type=int, default=50)
+    g.add_argument("--matching-warning-success-ratio", type=float, default=0.95)
+
+    g = parser.add_argument_group("Filtrado de puntos")
+    g.add_argument("--filter-radius-km", type=float, default=80.0)
+    g.add_argument("--temporal-filter", dest="filter_use_temporal", action=argparse.BooleanOptionalAction, default=True)
+    g.add_argument("--filter-temporal-order", type=int, default=3)
+    g.add_argument("--filter-temporal-threshold-mode", default="sigma", choices=["sigma", "absolute"])
+    g.add_argument("--filter-temporal-sigma", type=float, default=3.0)
+    g.add_argument("--filter-min-track-points", type=int, default=6)
+    g.add_argument("--filter-min-track-coverage", type=float, default=0.20)
+    g.add_argument("--filter-max-gap-frames", type=int, default=8)
+    g.add_argument(
+        "--pre-spatial-filter",
+        dest="filter_use_pre_spatial_filter",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Activa/desactiva el prefiltro espacial antes del filtrado temporal.",
+    )
+    g.add_argument("--filter-plot-dir", default=None, help="Carpeta de plots QC. Si se omite: <base-dir>/temporal_qc_plots.")
+    g.add_argument("--filter-plot-reference-frames", default="first,mid,last")
+    g.add_argument("--filter-diagnostic-inset", type=float, default=0.25)
+
+    g = parser.add_argument_group("Georreferenciacion")
+    g.add_argument("--georef-plot-every", type=int, default=50)
+
+    g = parser.add_argument_group("VIIRS")
+    g.add_argument("--viirs-nproc", type=int, default=8)
+    g.add_argument("--viirs-mode", default="fast", choices=["fast", "safe"])
+    g.add_argument("--viirs-roi-mode", default="gcp")
+    g.add_argument("--viirs-roi-margin-px", type=int, default=10)
+    g.add_argument("--viirs-align", default="roi_exact")
+    g.add_argument("--viirs-resampling", default="bilinear", choices=["nearest", "bilinear", "cubic"])
+    g.add_argument("--viirs-threads", default="auto")
+
+    g = parser.add_argument_group("Flujo optico")
+    g.add_argument("--optical-flow-plot-every", type=int, default=50)
+    g.add_argument("--flow-crop-x-start", type=float, default=0.0)
+    g.add_argument("--flow-crop-x-end", type=float, default=1.0)
+    g.add_argument("--flow-crop-y-start", type=float, default=0.0)
+    g.add_argument("--flow-crop-y-end", type=float, default=1.0)
+
+    return parser
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    return build_arg_parser().parse_args(argv)
+
 # ============================================================
 # PIPELINE
 # ============================================================
 
-def main():
+def main(argv=None):
+    args = parse_args(argv)
+
+    # Imports diferidos: si el usuario solo pide --help, argparse sale antes
+    # de llegar aquí y no se carga Blender/bpy.
+    global cv2, np
+    import cv2 as _cv2
+    import numpy as _np
+
+    from pipelinentl.get_pics import download_all_images
+    from pipelinentl.generate_timelapse import (
+        extract_exif_data,
+        get_image_files,
+    )
+    from pipelinentl import generate_timelapse
+    from pipelinentl import angle_search
+
+    cv2 = _cv2
+    np = _np
+
     # ============================================================
-    # 1. CONFIGURACIÓN GENERAL DEL EXPERIMENTO
+    # 1. CONFIGURACION GENERAL DEL EXPERIMENTO
     # ============================================================
 
-    mission = "ISS067"
-    start_id = 362508 
-    end_id = 363421
+    data_root = Path(args.data_root).expanduser().resolve()
 
-    base_dir = DATA_ROOT / f"{mission}-E-{start_id}-{end_id}"
+    mission = args.mission
+    start_id = int(args.start_id)
+    end_id = int(args.end_id)
+
+    if end_id < start_id:
+        raise ValueError(f"end_id ({end_id}) debe ser >= start_id ({start_id}).")
+
+    if args.base_dir:
+        base_dir = Path(args.base_dir).expanduser().resolve()
+    else:
+        base_dir = data_root / f"{mission}-E-{start_id}-{end_id}"
 
     pics_dir = base_dir / "pics"
     output_dir = base_dir / "output"
@@ -503,109 +676,142 @@ def main():
     corrected_points_dir = base_dir / "corrected_points"
     geo_corrected_dir = base_dir / "geo_corrected"
 
-    tle_dir = required_path(DATA_ROOT / "ISS_tle", "directorio de TLE")
+    tle_dir = required_path(
+        Path(args.tle_dir) if args.tle_dir else data_root / "ISS_tle",
+        "directorio de TLE",
+    )
 
+    default_texture_name = "VNL_v2_npp_2020_global_vcmslcfg_c202102150000.median_masked.sqrt.full.40k_20k.png"
     texture_path = str(required_path(
-        DATA_ROOT / "VNL_v2_npp_2020_global_vcmslcfg_c202102150000.median_masked.sqrt.full.40k_20k.png",
+        Path(args.texture_path) if args.texture_path else data_root / default_texture_name,
         "textura nocturna para Blender",
     ))
 
+    default_viirs_name = "VNL_v2_npp_2021_global_vcmslcfg_c202203152300.median_masked.tif"
     viirs_tiff_path = str(required_path(
-        DATA_ROOT / "VNL_v2_npp_2021_global_vcmslcfg_c202203152300.median_masked.tif",
+        Path(args.viirs_tiff_path) if args.viirs_tiff_path else data_root / default_viirs_name,
         "mosaico VIIRS",
     ))
 
-    earth_radius = 10.0
+    earth_radius = float(args.earth_radius)
 
     # ------------------------------------------------------------
     # Controles principales
     # ------------------------------------------------------------
 
-    use_angle_search = True
-    reuse_cached_angles = True
+    use_angle_search = bool(args.use_angle_search)
+    reuse_cached_angles = bool(args.reuse_cached_angles)
 
-    rerun_simulation_if_exists = False
-    rerun_matching_if_exists = False
-    rerun_projection_if_exists = False
-    rerun_filtering_if_exists = False
-    rerun_first_georef_if_exists = False
-    rerun_viirs_if_exists = False
-    rerun_optical_flow_if_exists = False
-    rerun_correct_points_if_exists = False
-    rerun_second_georef_if_exists = False
+    rerun_simulation_if_exists = bool(args.rerun_simulation_if_exists)
+    rerun_matching_if_exists = bool(args.rerun_matching_if_exists)
+    rerun_projection_if_exists = bool(args.rerun_projection_if_exists)
+    rerun_filtering_if_exists = bool(args.rerun_filtering_if_exists)
+    rerun_first_georef_if_exists = bool(args.rerun_first_georef_if_exists)
+    rerun_viirs_if_exists = bool(args.rerun_viirs_if_exists)
+    rerun_optical_flow_if_exists = bool(args.rerun_optical_flow_if_exists)
+    rerun_correct_points_if_exists = bool(args.rerun_correct_points_if_exists)
+    rerun_second_georef_if_exists = bool(args.rerun_second_georef_if_exists)
 
-    use_optical_flow = True
+    use_optical_flow = bool(args.use_optical_flow)
+    second_georef_mode = args.second_georef_mode
+    second_georef_samples = int(args.second_georef_samples)
 
-    # "none", "full", "sample"
-    second_georef_mode = "sample"
+    # Angulos fallback
+    yaw = float(args.yaw)
+    pitch = float(args.pitch)
+    roll = float(args.roll)
 
-    # Ángulos fallback
-    yaw = 12.5
-    pitch = 63.5
-    roll = -1.0
-
-    orientation_mode = "forward"
+    orientation_mode = args.orientation_mode
 
     # Offsets temporales
-    time_offset_seconds = 0.0
-    time_offset_minutes = 0.0
-    time_offset_hours = 0.0
+    time_offset_seconds = float(args.time_offset_seconds)
+    time_offset_minutes = float(args.time_offset_minutes)
+    time_offset_hours = float(args.time_offset_hours)
 
     # ------------------------------------------------------------
-    # Parámetros de búsqueda de ángulos
+    # Parametros de busqueda de angulos
     # ------------------------------------------------------------
 
-    yaw_range = (-180.0, 180.0)
-    pitch_range = (30.0, 90.0)
-    roll_range = (-45.0, 45.0)
+    yaw_range = tuple(map(float, args.yaw_range))
+    pitch_range = tuple(map(float, args.pitch_range))
+    roll_range = tuple(map(float, args.roll_range))
 
-    coarse_steps = (10.0, 5.0, 5.0)
+    coarse_steps = tuple(map(float, args.coarse_steps))
+    fine_steps = tuple(map(float, args.fine_steps))
+    fine_windows = tuple(map(float, args.fine_windows))
+    refine_steps = tuple(map(float, args.refine_steps))
+    refine_windows = tuple(map(float, args.refine_windows))
 
-    fine_steps = (2.5, 1.5, 1.0)
-    fine_windows = (5.0, 4.0, 3.0)
+    angle_reference_fractions = tuple(map(float, args.angle_reference_fractions))
+    simplex_max_iter = int(args.simplex_max_iter)
+    simplex_max_evals = int(args.simplex_max_evals)
+    simplex_score_tol = float(args.simplex_score_tol)
 
-    refine_steps = (1.0, 0.5, 0.5)
-    refine_windows = (2.0, 1.0, 1.0)
+    # Sensor fisico
+    sensor_width = float(args.sensor_width)
+    sensor_height = float(args.sensor_height)
 
-    # Sensor físico
-    sensor_width = 36.0
-    sensor_height = 28.0
+    # Parametros del backend de matching. Usuarios nuevos usan vismatch por pip.
+    # El backend legacy matching solo se activa si se indica explicitamente o si auto lo encuentra.
+    matcher_backend = args.matcher_backend
+    matcher_model = args.matcher_model
+    matching_repo = args.matching_repo
+    matcher_device = args.matcher_device
+    no_orb_fallback = bool(args.no_orb_fallback)
 
-    # Parámetros matching
-    # Parámetros matching
-    matching_grid_step = 185
-    matching_show_every = 50
-    matching_min_grid_points = 30
-    matching_plot_max_matches = 150
+    # Parametros matching
+    matching_grid_step = int(args.matching_grid_step)
+    matching_show_every = int(args.matching_show_every)
+    matching_min_grid_points = int(args.matching_min_grid_points)
+    matching_plot_max_matches = int(args.matching_plot_max_matches)
 
-    # Mínimo DURO para continuar.
-    # En timelapses con mucho mar/nubes no tiene sentido exigir 95%.
-    # La pipeline continuará si hay al menos:
-    #   max(matching_min_success_count_to_continue,
-    #       matching_min_success_ratio_to_continue * n_images)
-    # CSVs válidos.
-    matching_min_success_ratio_to_continue = 0.20
-    matching_min_success_count_to_continue = 50
+    matching_min_success_ratio_to_continue = float(args.matching_min_success_ratio_to_continue)
+    matching_min_success_count_to_continue = int(args.matching_min_success_count_to_continue)
+    matching_warning_success_ratio = float(args.matching_warning_success_ratio)
 
-    # Umbral recomendado solo para aviso, no para parar.
-    matching_warning_success_ratio = 0.95
+    # Parametros filter_points
+    filter_radius_km = float(args.filter_radius_km)
+    filter_use_temporal = bool(args.filter_use_temporal)
+    filter_temporal_order = int(args.filter_temporal_order)
+    filter_temporal_threshold_mode = args.filter_temporal_threshold_mode
+    filter_temporal_sigma = float(args.filter_temporal_sigma)
+    filter_min_track_points = int(args.filter_min_track_points)
+    filter_min_track_coverage = float(args.filter_min_track_coverage)
+    filter_max_gap_frames = int(args.filter_max_gap_frames)
+    filter_use_pre_spatial_filter = bool(args.filter_use_pre_spatial_filter)
+    filter_plot_dir = Path(args.filter_plot_dir).expanduser().resolve() if args.filter_plot_dir else base_dir / "temporal_qc_plots"
+    filter_plot_reference_frames = args.filter_plot_reference_frames
+    filter_diagnostic_inset = float(args.filter_diagnostic_inset)
 
-    # Parámetros filter_points
-    filter_radius_km = 80
+    # Parametros georef
+    georef_plot_every = int(args.georef_plot_every)
 
-    # Parámetros georef
-    georef_plot_every = 50
+    # Parametros VIIRS
+    viirs_nproc = int(args.viirs_nproc)
+    viirs_mode = args.viirs_mode
+    viirs_roi_mode = args.viirs_roi_mode
+    viirs_roi_margin_px = int(args.viirs_roi_margin_px)
+    viirs_align = args.viirs_align
+    viirs_resampling = args.viirs_resampling
+    viirs_threads = args.viirs_threads
 
-    # Parámetros VIIRS
-    viirs_nproc = 8
-    viirs_mode = "fast"
-    viirs_roi_mode = "gcp"
-    viirs_roi_margin_px = 10
-    viirs_align = "roi_exact"
-    viirs_resampling = "bilinear"
+    # Parametros optical flow
+    optical_flow_plot_every = int(args.optical_flow_plot_every)
+    flow_crop_x_start = float(args.flow_crop_x_start)
+    flow_crop_x_end = float(args.flow_crop_x_end)
+    flow_crop_y_start = float(args.flow_crop_y_start)
+    flow_crop_y_end = float(args.flow_crop_y_end)
 
-    # Parámetros optical flow
-    optical_flow_plot_every = 50
+    print("Configuracion principal:")
+    print(f"  mission = {mission}")
+    print(f"  start_id = {start_id}")
+    print(f"  end_id = {end_id}")
+    print(f"  data_root = {data_root}")
+    print(f"  base_dir = {base_dir}")
+    print(f"  use_angle_search = {use_angle_search}")
+    print(f"  use_optical_flow = {use_optical_flow}")
+    print(f"  second_georef_mode = {second_georef_mode}")
+    print(f"  matcher_backend = {matcher_backend}")
 
     # ============================================================
     # CONTADOR DE PASOS
@@ -779,7 +985,7 @@ def main():
                 image_files=img_files,
                 start_dt=start_dt,
                 delta=delta,
-                reference_fractions=(0.0, 1.0 / 3.0, 0.5, 2.0 / 3.0, 1.0),
+                reference_fractions=angle_reference_fractions,
             )
 
             reference_search_output_dir = (
@@ -812,6 +1018,14 @@ def main():
 
                 orientation_mode=orientation_mode,
                 earth_radius=earth_radius,
+                matcher_backend=matcher_backend,
+                matcher_model=matcher_model,
+                matching_repo=matching_repo,
+                device=matcher_device,
+                no_orb_fallback=no_orb_fallback,
+                simplex_max_iter=simplex_max_iter,
+                simplex_max_evals=simplex_max_evals,
+                simplex_score_tol=simplex_score_tol,
             )
 
             if best_angles is not None:
@@ -1074,7 +1288,12 @@ def main():
         "matching_show_every": matching_show_every,
         "matching_min_grid_points": matching_min_grid_points,
         "matching_plot_max_matches": matching_plot_max_matches,
-        "match_timelapse_version": "ransac_normalized_poly_grid_visualization_v1",
+        "matcher_backend": matcher_backend,
+        "matcher_model": matcher_model,
+        "matching_repo": matching_repo,
+        "matcher_device": matcher_device,
+        "no_orb_fallback": no_orb_fallback,
+        "match_timelapse_version": "portable_backend_ransac_normalized_poly_grid_visualization_v2",
     }
     match_config_file = matches_output_dir / "_match_config.json"
 
@@ -1181,7 +1400,12 @@ def main():
                 "--show_every", str(matching_show_every),
                 "--min_grid_points", str(matching_min_grid_points),
                 "--plot_max_matches", str(matching_plot_max_matches),
-            ],
+                "--matcher_backend", matcher_backend,
+            ]
+            + (["--matcher_model", str(matcher_model)] if matcher_model else [])
+            + (["--matching_repo", str(matching_repo)] if matching_repo else [])
+            + (["--device", str(matcher_device)] if matcher_device else [])
+            + (["--no_orb_fallback"] if no_orb_fallback else []),
             check=True,
         )
 
@@ -1319,6 +1543,17 @@ def main():
         **common_config,
         "step": "filter_points",
         "filter_radius_km": filter_radius_km,
+        "filter_use_temporal": filter_use_temporal,
+        "filter_temporal_order": filter_temporal_order,
+        "filter_temporal_threshold_mode": filter_temporal_threshold_mode,
+        "filter_temporal_sigma": filter_temporal_sigma,
+        "filter_min_track_points": filter_min_track_points,
+        "filter_min_track_coverage": filter_min_track_coverage,
+        "filter_max_gap_frames": filter_max_gap_frames,
+        "filter_use_pre_spatial_filter": filter_use_pre_spatial_filter,
+        "filter_plot_dir": str(filter_plot_dir),
+        "filter_plot_reference_frames": filter_plot_reference_frames,
+        "filter_diagnostic_inset": filter_diagnostic_inset,
         "n_projected_points": n_projected_points,
     }
     filter_config_file = filtered_points_dir / "_filter_config.json"
@@ -1336,34 +1571,33 @@ def main():
         remove_points_in_range(filtered_points_dir, start_id, end_id, "puntos filtrados")
         filter_config_file.unlink(missing_ok=True)
 
-        subprocess.run(
-            [
-                sys.executable, "-m", "pipelinentl.filter_points",
-                "--input_folder", str(output_dir),
-                "--output_folder", str(filtered_points_dir),
-                "--radius_km", "80",
-                "--start_id", str(start_id),
-                "--end_id", str(end_id),
-                "--mission", mission,
+        filter_cmd = [
+            sys.executable, "-m", "pipelinentl.filter_points",
+            "--input_folder", str(output_dir),
+            "--output_folder", str(filtered_points_dir),
+            "--radius_km", str(filter_radius_km),
+            "--start_id", str(start_id),
+            "--end_id", str(end_id),
+            "--mission", mission,
+            "--temporal_order", str(filter_temporal_order),
+            "--temporal_threshold_mode", filter_temporal_threshold_mode,
+            "--temporal_sigma", str(filter_temporal_sigma),
+            "--min_track_points", str(filter_min_track_points),
+            "--min_track_coverage", str(filter_min_track_coverage),
+            "--max_gap_frames", str(filter_max_gap_frames),
+            "--plot_dir", str(filter_plot_dir),
+            "--image_dir", str(pics_dir),
+            "--plot_reference_frames", filter_plot_reference_frames,
+            "--diagnostic_inset", str(filter_diagnostic_inset),
+        ]
 
-                "--disable_temporal",
+        if not filter_use_temporal:
+            filter_cmd.append("--disable_temporal")
 
-                "--temporal_order", "3",
-                "--temporal_threshold_mode", "sigma",
-                "--temporal_sigma", "3.0",
-                "--min_track_points", "6",
-                "--min_track_coverage", "0.20",
-                "--max_gap_frames", "8",
+        if not filter_use_pre_spatial_filter:
+            filter_cmd.append("--no_pre_spatial_filter")
 
-                "--no_pre_spatial_filter",
-
-                "--plot_dir", str(base_dir / "temporal_qc_plots"),
-                "--image_dir", str(pics_dir),
-                "--plot_reference_frames", "first,mid,last",
-                "--diagnostic_inset", "0.25",
-            ],
-            check=True,
-        )
+        subprocess.run(filter_cmd, check=True)
 
         existing_filtered_count = count_points_in_range(filtered_points_dir, start_id, end_id)
 
@@ -1513,7 +1747,7 @@ def main():
                 "--align", viirs_align,
                 "--resampling", viirs_resampling,
 
-                "--threads", "auto",
+                "--threads", str(viirs_threads),
             ],
             check=True,
         )
@@ -1545,6 +1779,10 @@ def main():
         **common_config,
         "step": "optical_flow",
         "optical_flow_plot_every": optical_flow_plot_every,
+        "flow_crop_x_start": flow_crop_x_start,
+        "flow_crop_x_end": flow_crop_x_end,
+        "flow_crop_y_start": flow_crop_y_start,
+        "flow_crop_y_end": flow_crop_y_end,
         "geo_dir": str(geo_dir),
         "viirs_output_dir": str(viirs_output_dir),
         "n_viirs": n_viirs,
@@ -1577,10 +1815,10 @@ def main():
                 "--end_id", str(end_id),
                 "--plot_every", str(optical_flow_plot_every),
 
-                "--crop_x_start", "0.0",
-                "--crop_x_end", "1.0",
-                "--crop_y_start", "0.0",
-                "--crop_y_end", "1.0",
+                "--crop_x_start", str(flow_crop_x_start),
+                "--crop_x_end", str(flow_crop_x_end),
+                "--crop_y_start", str(flow_crop_y_start),
+                "--crop_y_end", str(flow_crop_y_end),
             ],
             check=True,
         )
@@ -1617,6 +1855,10 @@ def main():
         "flow_dir": str(flow_dir),
         "geo_dir": str(geo_dir),
         "expected_corrected": expected_corrected,
+        "flow_crop_x_start": flow_crop_x_start,
+        "flow_crop_x_end": flow_crop_x_end,
+        "flow_crop_y_start": flow_crop_y_start,
+        "flow_crop_y_end": flow_crop_y_end,
     }
     corrected_config_file = corrected_points_dir / "_corrected_points_config.json"
 
@@ -1644,6 +1886,10 @@ def main():
                 "--output_dir", str(corrected_points_dir),
                 "--start_id", str(start_id),
                 "--end_id", str(end_id),
+                "--crop_x_start", str(flow_crop_x_start),
+                "--crop_x_end", str(flow_crop_x_end),
+                "--crop_y_start", str(flow_crop_y_start),
+                "--crop_y_end", str(flow_crop_y_end),
             ],
             check=True,
         )
@@ -1730,7 +1976,7 @@ def main():
         print(f"[{step}/{total_steps}] Segunda georreferenciación de muestra con puntos corregidos...")
 
         available_corrected_ids = ids_from_points_dir(corrected_points_dir, start_id, end_id)
-        sample_ids = sample_ids_from_available(available_corrected_ids, n_samples=10)
+        sample_ids = sample_ids_from_available(available_corrected_ids, n_samples=second_georef_samples)
 
         if not sample_ids:
             raise RuntimeError("No hay IDs corregidos disponibles para la georreferenciación de muestra.")

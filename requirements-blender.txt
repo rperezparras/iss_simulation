@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Blender Python API. If this fails, install Blender separately and run the pipeline
+# from a Blender-compatible Python environment.
+bpy==4.4.0

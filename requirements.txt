@@ -1,0 +1,35 @@
+# Core numerical stack
+# bpy 4.x and several compiled geospatial/image packages are safer with NumPy 1.x.
+numpy<2
+scipy
+pandas
+scikit-image
+scikit-learn
+
+# Image processing
+# OpenCV >=4.12 requires NumPy >=2 on recent Python versions, which conflicts with bpy.
+opencv-python-headless<4.12
+Pillow
+matplotlib
+
+# Geospatial / astronomy
+astropy
+skyfield
+rasterio
+shapely
+cartopy
+
+# Downloads, metadata and utilities
+requests
+tqdm
+exifread
+flow-vis
+
+# Deep learning and image matching
+# For CUDA-specific PyTorch builds, install torch/torchvision from the official PyTorch selector first.
+torch
+torchvision
+lightning>=2.3,<2.4
+# Latest rerun-sdk may require NumPy >=2; vismatch only needs it for optional logging/visualization.
+rerun-sdk<0.23
+vismatch

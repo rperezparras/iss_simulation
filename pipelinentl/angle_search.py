@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os
 import sys
 import math
@@ -5,7 +7,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -63,48 +65,145 @@ def squeeze_points(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
     return arr
 
 
-def extract_mkpts_from_result(result: Optional[dict]) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def result_get(result: Any, key: str):
+    """Acceso robusto a dicts u objetos con atributos."""
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        return result.get(key, None)
+    if hasattr(result, key):
+        return getattr(result, key)
+    return None
+
+
+def result_has(result: Any, key: str) -> bool:
+    """Comprueba si una salida de matcher contiene una clave/atributo."""
+    if result is None:
+        return False
+    if isinstance(result, dict):
+        return key in result
+    return hasattr(result, key)
+
+
+def sanitize_matched_points(
+    mkpts0: Optional[np.ndarray],
+    mkpts1: Optional[np.ndarray],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Convierte a float32 y elimina pares no finitos."""
+    mkpts0 = squeeze_points(mkpts0)
+    mkpts1 = squeeze_points(mkpts1)
+
+    if mkpts0 is None or mkpts1 is None:
+        return None, None
+
+    n = min(len(mkpts0), len(mkpts1))
+    if n <= 0:
+        return None, None
+
+    mkpts0 = np.asarray(mkpts0[:n], dtype=np.float32)
+    mkpts1 = np.asarray(mkpts1[:n], dtype=np.float32)
+
+    valid = np.isfinite(mkpts0).all(axis=1) & np.isfinite(mkpts1).all(axis=1)
+    mkpts0 = mkpts0[valid]
+    mkpts1 = mkpts1[valid]
+
+    if len(mkpts0) == 0:
+        return None, None
+
+    return mkpts0, mkpts1
+
+
+def extract_mkpts_from_result(result: Any) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Extrae correspondencias de forma compatible con vismatch actual y con
+    image-matching-models antiguo.
+
+    Convención:
+      imagen 0 = simulada
+      imagen 1 = real
+    """
     if result is None:
         return None, None
 
-    for k0, k1 in [
+    # Prioridad alta: inliers ya filtrados si el backend los proporciona.
+    direct_pairs = [
+        ("inlier_kpts0", "inlier_kpts1"),
+        ("inlier_mkpts0", "inlier_mkpts1"),
         ("mkpts0", "mkpts1"),
         ("m_kpts0", "m_kpts1"),
         ("matched_kpts0", "matched_kpts1"),
-    ]:
-        if k0 in result and k1 in result:
-            a = squeeze_points(to_numpy(result[k0]))
-            b = squeeze_points(to_numpy(result[k1]))
-            return a, b
+        ("matched_keypoints0", "matched_keypoints1"),
+    ]
 
-    for k0, k1 in [
+    for k0, k1 in direct_pairs:
+        if result_has(result, k0) and result_has(result, k1):
+            a = squeeze_points(to_numpy(result_get(result, k0)))
+            b = squeeze_points(to_numpy(result_get(result, k1)))
+            a, b = sanitize_matched_points(a, b)
+            if a is not None and b is not None:
+                return a, b
+
+    # Formatos con keypoints + índices de matches.
+    keypoint_pairs = [
         ("kpts0", "kpts1"),
         ("keypoints0", "keypoints1"),
-    ]:
-        if k0 in result and k1 in result:
-            pts0 = squeeze_points(to_numpy(result[k0]))
-            pts1 = squeeze_points(to_numpy(result[k1]))
+        ("all_kpts0", "all_kpts1"),
+    ]
 
-            if "matches" in result:
-                m = to_numpy(result["matches"])
-                if m is not None:
-                    m = np.asarray(m).astype(np.int64)
-                    if m.ndim == 2 and m.shape[1] == 2:
-                        return pts0[m[:, 0]], pts1[m[:, 1]]
+    for k0, k1 in keypoint_pairs:
+        if not (result_has(result, k0) and result_has(result, k1)):
+            continue
 
-            if "matches0" in result:
-                m0 = to_numpy(result["matches0"])
-                if m0 is not None:
-                    m0 = np.asarray(m0).astype(np.int64)
-                    valid = m0 >= 0
-                    return pts0[valid], pts1[m0[valid]]
+        pts0 = squeeze_points(to_numpy(result_get(result, k0)))
+        pts1 = squeeze_points(to_numpy(result_get(result, k1)))
+        if pts0 is None or pts1 is None:
+            continue
 
-            if "matches1" in result:
-                m1 = to_numpy(result["matches1"])
-                if m1 is not None:
-                    m1 = np.asarray(m1).astype(np.int64)
-                    valid = m1 >= 0
-                    return pts0[m1[valid]], pts1[valid]
+        # matches Nx2: columna 0 indexa pts0, columna 1 indexa pts1.
+        if result_has(result, "matches"):
+            m = to_numpy(result_get(result, "matches"))
+            if m is not None:
+                m = np.asarray(m)
+                if m.ndim == 3 and m.shape[0] == 1:
+                    m = m[0]
+                m = np.squeeze(m).astype(np.int64)
+                if m.ndim == 2 and m.shape[1] == 2:
+                    valid = (
+                        (m[:, 0] >= 0) & (m[:, 0] < len(pts0)) &
+                        (m[:, 1] >= 0) & (m[:, 1] < len(pts1))
+                    )
+                    if np.any(valid):
+                        a, b = sanitize_matched_points(pts0[m[valid, 0]], pts1[m[valid, 1]])
+                        if a is not None and b is not None:
+                            return a, b
+
+        # matches0: array (N0,) con índice en pts1 o -1.
+        if result_has(result, "matches0"):
+            m0 = to_numpy(result_get(result, "matches0"))
+            if m0 is not None:
+                m0 = np.asarray(m0)
+                if m0.ndim == 2 and m0.shape[0] == 1:
+                    m0 = m0[0]
+                m0 = np.squeeze(m0).astype(np.int64)
+                valid = (m0 >= 0) & (m0 < len(pts1))
+                if np.any(valid):
+                    a, b = sanitize_matched_points(pts0[valid], pts1[m0[valid]])
+                    if a is not None and b is not None:
+                        return a, b
+
+        # matches1: array (N1,) con índice en pts0 o -1.
+        if result_has(result, "matches1"):
+            m1 = to_numpy(result_get(result, "matches1"))
+            if m1 is not None:
+                m1 = np.asarray(m1)
+                if m1.ndim == 2 and m1.shape[0] == 1:
+                    m1 = m1[0]
+                m1 = np.squeeze(m1).astype(np.int64)
+                valid = (m1 >= 0) & (m1 < len(pts0))
+                if np.any(valid):
+                    a, b = sanitize_matched_points(pts0[m1[valid]], pts1[valid])
+                    if a is not None and b is not None:
+                        return a, b
 
     return None, None
 
@@ -158,9 +257,12 @@ def orb_fallback_matches(img0_bgr: np.ndarray, img1_bgr: np.ndarray, max_matches
 
 @dataclass
 class MatcherConfig:
-    model_name: str = "superpoint-lg"
+    # Backend público recomendado: vismatch. El backend antiguo matching queda
+    # sólo como compatibilidad opcional para instalaciones legacy.
+    matcher_backend: str = "auto"      # auto | vismatch | matching | none
+    model_name: Optional[str] = None    # None -> default según backend
     device: Optional[str] = None
-    matching_repo: Optional[str] = None
+    matching_repo: Optional[str] = None # ruta opcional indicada por CLI/env
     min_matches: int = 20
     no_orb_fallback: bool = False
     ransac_thresh_px: float = 3.0
@@ -219,32 +321,172 @@ class SearchConfig:
 # MATCHER FACTORY
 # -------------------------------------------------------------------
 
+def resolve_matching_repo(user_repo: Optional[str] = None) -> Optional[str]:
+    """
+    Devuelve una ruta local al repo de matching si el usuario la ha indicado.
+
+    Soporta:
+      - vismatch actual: repo con paquete ./vismatch
+      - image-matching-models antiguo: repo con paquete ./matching
+
+    Si vismatch está instalado por pip, no hace falta devolver ninguna ruta.
+    No usa rutas personales tipo /home/usuario/... para que el código sea portable.
+    """
+    candidates: List[str] = []
+
+    if user_repo:
+        candidates.append(user_repo)
+
+    candidates.extend([
+        os.environ.get("VISMATCH_REPO", ""),
+        os.environ.get("VISMATCH_DIR", ""),
+        os.environ.get("IMAGE_MATCHING_MODELS_DIR", ""),
+    ])
+
+    for c in candidates:
+        if not c:
+            continue
+
+        path = Path(c).expanduser().resolve()
+        if not path.exists():
+            continue
+
+        # Caso normal: ruta al repo que contiene el paquete.
+        if (path / "vismatch").exists() or (path / "matching").exists():
+            return str(path)
+
+        # Caso menos habitual: ruta directa al paquete vismatch/ o matching/.
+        if path.name in {"vismatch", "matching"} and (path / "__init__.py").exists():
+            return str(path.parent)
+
+        # Si el usuario lo ha pasado explícitamente, se acepta igualmente.
+        if user_repo:
+            return str(path)
+
+    return None
+
+
+def add_matching_repo_to_syspath(repo_path: Optional[str]) -> None:
+    """Añade el repo local al sys.path si se ha indicado y existe."""
+    if not repo_path:
+        return
+
+    path = Path(repo_path).expanduser().resolve()
+    if not path.exists():
+        return
+
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+        print(f"Repo local de matching añadido a sys.path: {path_str}")
+
+
 def create_matcher(cfg: MatcherConfig):
+    """
+    Carga un matcher y devuelve (matcher, device).
+
+    Backends:
+      - auto: prueba vismatch y después matching antiguo.
+      - vismatch: fuerza vismatch.
+      - matching: fuerza image-matching-models antiguo.
+      - none: no carga matcher; se usará ORB fallback.
+    """
     device = cfg.device or ("cuda" if torch.cuda.is_available() else "cpu")
     if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA no disponible, usando CPU.")
         device = "cpu"
 
-    matching_repo = cfg.matching_repo
-    if matching_repo is None:
-        candidates = [
-            os.environ.get("IMAGE_MATCHING_MODELS_DIR", ""),
-            "/home/rpz/image-matching-models",
-            "/home/raul/image-matching-models",
-        ]
-        for c in candidates:
-            if c and Path(c).exists():
-                matching_repo = c
-                break
-
-    if matching_repo and Path(matching_repo).exists() and matching_repo not in sys.path:
-        sys.path.insert(0, matching_repo)
-
-    try:
-        from matching import get_matcher  # type: ignore
-        matcher = get_matcher(cfg.model_name, device=device)
-        return matcher, device
-    except Exception:
+    backend = cfg.matcher_backend
+    if backend == "none":
+        print("Matcher neural desactivado. Se usará ORB fallback.")
         return None, device
+
+    repo_path = resolve_matching_repo(cfg.matching_repo)
+    add_matching_repo_to_syspath(repo_path)
+
+    backends = [backend]
+    if backend == "auto":
+        backends = ["vismatch", "matching"]
+
+    errors: List[str] = []
+
+    for candidate_backend in backends:
+        if candidate_backend == "vismatch":
+            model_name = cfg.model_name or "superpoint-lightglue"
+            try:
+                from vismatch import get_matcher  # type: ignore
+                import vismatch as vismatch_mod  # type: ignore
+
+                print(f"vismatch importado desde: {vismatch_mod.__file__}")
+                matcher = get_matcher(model_name, device=device)
+                print(f"Matcher cargado: backend=vismatch | model={model_name}")
+                return matcher, device
+            except Exception as e:
+                errors.append(f"vismatch({model_name}): {repr(e)}")
+                continue
+
+        if candidate_backend == "matching":
+            model_name = cfg.model_name or "superpoint-lg"
+            try:
+                from matching import get_matcher  # type: ignore
+                import matching as matching_mod  # type: ignore
+
+                print(f"matching importado desde: {matching_mod.__file__}")
+                matcher = get_matcher(model_name, device=device)
+                print(f"Matcher cargado: backend=matching | model={model_name}")
+                return matcher, device
+            except Exception as e:
+                errors.append(f"matching({model_name}): {repr(e)}")
+                continue
+
+    print("No se pudo cargar ningún matcher neural.")
+    for err in errors:
+        print(f"   - {err}")
+    print("Se usará ORB fallback en todos los candidatos.")
+    return None, device
+
+
+def load_image_for_matcher(
+    matcher,
+    path: str,
+    device: str,
+    resize_hw: Optional[Tuple[int, int]] = None,
+    resize_long_side: Optional[int] = None,
+) -> Any:
+    """
+    Carga imagen para el matcher.
+
+    vismatch actual suele exponer matcher.load_image(path, resize=...). Si no
+    existe, se usa el loader tensorial clásico compatible con image-matching-models.
+    """
+    if matcher is not None and hasattr(matcher, "load_image"):
+        try:
+            if resize_long_side is not None:
+                img = matcher.load_image(str(path), resize=int(resize_long_side))
+            else:
+                img = matcher.load_image(str(path))
+            if torch.is_tensor(img):
+                img = img.to(device)
+            return img
+        except TypeError:
+            # Algunos wrappers no aceptan resize como argumento.
+            img = matcher.load_image(str(path))
+            if torch.is_tensor(img):
+                img = img.to(device)
+            return img
+
+    return image_loader(str(path), resize=resize_hw).to(device)
+
+
+def run_matcher(matcher, img0, img1):
+    """Ejecuta matcher soportando wrappers con o sin dimensión batch."""
+    with torch.inference_mode():
+        try:
+            return matcher(img0, img1)
+        except Exception as first_error:
+            if torch.is_tensor(img0) and torch.is_tensor(img1) and img0.ndim == 3 and img1.ndim == 3:
+                return matcher(img0.unsqueeze(0), img1.unsqueeze(0))
+            raise first_error
 
 
 # -------------------------------------------------------------------
@@ -537,13 +779,24 @@ def robust_match_and_fit(
     mkpts0 = mkpts1 = None
 
     if matcher is not None:
-        sim_t = image_loader(img_sim_path, resize=(work_h, work_w)).to(device)
-        real_t = image_loader(img_real_path, resize=(work_h, work_w)).to(device)
-        with torch.inference_mode():
-            try:
-                result = matcher(sim_t, real_t)
-            except Exception:
-                result = matcher(sim_t.unsqueeze(0), real_t.unsqueeze(0))
+        # Para vismatch usamos matcher.load_image si existe; para el backend
+        # antiguo usamos el loader tensorial clásico.
+        resize_long_side = matcher_cfg.work_max_side if max_side > matcher_cfg.work_max_side else None
+        sim_t = load_image_for_matcher(
+            matcher,
+            img_sim_path,
+            device=device,
+            resize_hw=(work_h, work_w),
+            resize_long_side=resize_long_side,
+        )
+        real_t = load_image_for_matcher(
+            matcher,
+            img_real_path,
+            device=device,
+            resize_hw=(work_h, work_w),
+            resize_long_side=resize_long_side,
+        )
+        result = run_matcher(matcher, sim_t, real_t)
         mkpts0, mkpts1 = extract_mkpts_from_result(result)
 
     n_raw = 0 if mkpts0 is None else len(mkpts0)
@@ -1317,6 +1570,11 @@ def search_best_yaw_pitch_roll(
     orientation_mode="forward",
     earth_radius=10,
     metrics_jsonl=None,
+    matcher_backend="auto",
+    matcher_model=None,
+    matching_repo=None,
+    device=None,
+    no_orb_fallback=False,
     simplex_max_iter=45,
     simplex_max_evals=140,
     simplex_score_tol=1e-3,
@@ -1357,6 +1615,13 @@ def search_best_yaw_pitch_roll(
         orientation_mode=orientation_mode,
         earth_radius=earth_radius,
         search_cfg=search_cfg,
+        matcher_cfg=MatcherConfig(
+            matcher_backend=matcher_backend,
+            model_name=matcher_model,
+            matching_repo=matching_repo,
+            device=device,
+            no_orb_fallback=no_orb_fallback,
+        ),
         metrics_jsonl=metrics_jsonl,
     )
 
@@ -1381,6 +1646,11 @@ def search_best_yaw_pitch(
     orientation_mode="forward",
     earth_radius=10,
     metrics_jsonl=None,
+    matcher_backend="auto",
+    matcher_model=None,
+    matching_repo=None,
+    device=None,
+    no_orb_fallback=False,
     simplex_max_iter=45,
     simplex_max_evals=140,
     simplex_score_tol=1e-3,
@@ -1419,6 +1689,11 @@ def search_best_yaw_pitch(
         orientation_mode=orientation_mode,
         earth_radius=earth_radius,
         metrics_jsonl=metrics_jsonl,
+        matcher_backend=matcher_backend,
+        matcher_model=matcher_model,
+        matching_repo=matching_repo,
+        device=device,
+        no_orb_fallback=no_orb_fallback,
         simplex_max_iter=simplex_max_iter,
         simplex_max_evals=simplex_max_evals,
         simplex_score_tol=simplex_score_tol,
@@ -1462,6 +1737,24 @@ if __name__ == "__main__":
     parser.add_argument("--fine_roll_step", type=float, default=1)
     parser.add_argument("--orientation_mode", choices=["north", "forward"], default="forward")
     parser.add_argument("--metrics_jsonl", default=None)
+    parser.add_argument(
+        "--matcher_backend",
+        choices=["auto", "vismatch", "matching", "none"],
+        default="auto",
+        help="Backend de matching: auto usa vismatch si está instalado y si no prueba matching legacy.",
+    )
+    parser.add_argument(
+        "--matcher_model",
+        default=None,
+        help="Nombre del modelo. Por defecto: superpoint-lightglue en vismatch, superpoint-lg en matching legacy.",
+    )
+    parser.add_argument(
+        "--matching_repo",
+        default=None,
+        help="Ruta opcional a un repo local de vismatch o image-matching-models. También se puede usar VISMATCH_REPO o IMAGE_MATCHING_MODELS_DIR.",
+    )
+    parser.add_argument("--device", choices=["cpu", "cuda"], default=None)
+    parser.add_argument("--no_orb_fallback", action="store_true")
     parser.add_argument("--simplex_max_iter", type=int, default=45)
     parser.add_argument("--simplex_max_evals", type=int, default=140)
     parser.add_argument("--simplex_score_tol", type=float, default=1e-3)
@@ -1489,6 +1782,11 @@ if __name__ == "__main__":
         fine_steps=(args.fine_yaw_step, args.fine_pitch_step, args.fine_roll_step),
         orientation_mode=args.orientation_mode,
         metrics_jsonl=args.metrics_jsonl,
+        matcher_backend=args.matcher_backend,
+        matcher_model=args.matcher_model,
+        matching_repo=args.matching_repo,
+        device=args.device,
+        no_orb_fallback=args.no_orb_fallback,
         simplex_max_iter=args.simplex_max_iter,
         simplex_max_evals=args.simplex_max_evals,
         simplex_score_tol=args.simplex_score_tol,

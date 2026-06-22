@@ -1,4 +1,53 @@
-
-# Python cache
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Local backups / temporary files
+*_old.py
+*.bak
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+
+# Logs and caches
+*.log
+.cache/
+.ipynb_checkpoints/
+
+# Full pipeline experiment folders and generated outputs
+ISS*-E-*/
+search_angles/
+temporal_qc_plots/
+
+# Generated geospatial/image products
+*.tif
+*.tiff
+*.vrt
+*.tfw
+*.aux.xml
+*.points
+*.npy
+
+# Blender files / renders
+*.blend
+*.blend1
+render_output_*.png
+
+# Diagnostic plots
+matches_color_*.png
+grid_real_*.png
+grid_sim_deformed_*.png
+*_comparison.png
+*_flow_vis.png
+iss_path_map.png
+
+# Large external datasets
+ISS_tle/
+VNL_v2_*.png
+VNL_v2_*.tif
