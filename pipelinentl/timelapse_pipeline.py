@@ -156,26 +156,32 @@ def step_should_run(
     """
     Decide si un paso debe ejecutarse.
 
-    Ejecuta si:
-    - force_this_step es True;
-    - force_downstream es True;
-    - no hay suficientes archivos;
-    - la configuración guardada no coincide con la actual.
+    Política por defecto: reutilizar outputs completos.
 
-    Si los outputs están completos pero falta el JSON de configuración,
-    se asume válido y se escribe la configuración actual.
+    Ejecuta solo si:
+    - force_this_step es True;
+    - faltan outputs suficientes.
+
+    Si la configuración guardada no coincide, o si un paso anterior cambió,
+    se avisa pero NO se recalcula si los outputs ya están completos. Para
+    recalcular explícitamente se usan las flags --rerun-*.
     """
     if force_this_step:
         print(f"   AVISO {label}: forzado por configuración.")
         return True
 
-    if force_downstream:
-        print(f"   AVISO {label}: se recalculará porque un paso anterior cambió.")
-        return True
-
     complete = is_complete(folder, pattern, expected, label)
     if not complete:
         return True
+
+    if force_downstream:
+        print(
+            f"   AVISO {label}: un paso anterior cambió, pero los outputs están completos. "
+            "Se reutilizan. Usa la flag --rerun-* correspondiente para recalcular."
+        )
+        if config_file is not None and current_config is not None:
+            write_json(config_file, current_config)
+        return False
 
     if config_file is not None and current_config is not None:
         old_config = read_json(config_file)
@@ -189,8 +195,12 @@ def step_should_run(
             return False
 
         if not configs_equal(old_config, current_config):
-            print(f"   AVISO {label}: configuración distinta. Se recalculará.")
-            return True
+            print(
+                f"   AVISO {label}: configuración distinta, pero outputs completos. "
+                "Se reutilizan. Usa la flag --rerun-* correspondiente para recalcular."
+            )
+            write_json(config_file, current_config)
+            return False
 
     return False
 
@@ -1197,11 +1207,15 @@ def main(argv=None):
 
             if changed_keys:
                 print("   AVISO renders simulados: cambió configuración geométrica real.")
-                print("   Claves que fuerzan rerender:")
+                print("   Claves distintas respecto a _render_config.json:")
                 for k, old_v, new_v in changed_keys:
                     print(f"      {k}: {old_v!r} -> {new_v!r}")
-
-                run_simulation = True
+                print(
+                    "   Como los renders ya están completos, se reutilizan. "
+                    "Usa --rerun-simulation si quieres regenerarlos."
+                )
+                run_simulation = False
+                write_json(sim_config_file, sim_config)
 
             else:
                 print(
@@ -1333,6 +1347,13 @@ def main(argv=None):
 
     match_outputs_ok = n_existing_csv >= min_csv_hard
 
+    # Si los CSVs de matching faltan o quedaron incompletos, pero ya existen
+    # outputs posteriores suficientes, no tiene sentido repetir matching. Esto
+    # permite reanudar desde pasos posteriores aunque un intermedio haya sido
+    # limpiado accidentalmente.
+    downstream_projected_count = count_nonempty(output_dir, "*_real.points")
+    downstream_projected_ok = downstream_projected_count >= min_csv_hard
+
     print(
         f"   CSVs de matching existentes: {n_existing_csv}/{n_images} "
         f"({100 * n_existing_csv / max(n_images, 1):.1f}%)."
@@ -1350,9 +1371,14 @@ def main(argv=None):
         print("   AVISO matching: forzado por configuración.")
         run_matching = True
 
-    elif force_downstream:
-        print("   AVISO matching: se recalculará porque un paso anterior cambió.")
-        run_matching = True
+    elif not match_outputs_ok and downstream_projected_ok:
+        print(
+            f"   AVISO CSVs de matching: insuficientes ({n_existing_csv}/{n_images}), "
+            f"pero ya existen puntos proyectados suficientes "
+            f"({downstream_projected_count}/{n_images}). Se omite matching y se continúa "
+            "desde los outputs posteriores. Usa --rerun-matching si quieres regenerar CSVs."
+        )
+        run_matching = False
 
     elif not match_outputs_ok:
         print(
@@ -1361,6 +1387,14 @@ def main(argv=None):
             f"Mínimo duro requerido: {min_csv_hard}."
         )
         run_matching = True
+
+    elif force_downstream:
+        print(
+            "   AVISO matching: un paso anterior cambió, pero hay CSVs suficientes. "
+            "Se reutilizan. Usa --rerun-matching si quieres recalcularlos."
+        )
+        write_json(match_config_file, match_config)
+        run_matching = False
 
     elif old_match_config_comparable is None:
         print(
@@ -1372,8 +1406,12 @@ def main(argv=None):
         run_matching = False
 
     elif not configs_equal(old_match_config_comparable, match_config):
-        print("   AVISO matching: configuración que afecta al matching distinta. Se recalculará.")
-        run_matching = True
+        print(
+            "   AVISO matching: configuración distinta, pero hay CSVs suficientes. "
+            "Se reutilizan. Usa --rerun-matching si quieres recalcularlos."
+        )
+        write_json(match_config_file, match_config)
+        run_matching = False
 
     else:
         print(
@@ -1441,6 +1479,14 @@ def main(argv=None):
 
     n_valid_csv = count_nonempty(matches_output_dir, "transformed_coordinates_*.csv")
     print(f"   Frames con CSV de matching válido: {n_valid_csv}/{n_images}")
+
+    if n_valid_csv < min_csv_hard and downstream_projected_ok:
+        print(
+            f"   AVISO: hay pocos CSVs de matching ({n_valid_csv}/{n_images}), "
+            f"pero se usarán los puntos proyectados existentes "
+            f"({downstream_projected_count}/{n_images}) para continuar."
+        )
+        n_valid_csv = downstream_projected_count
 
     if n_valid_csv < min_csv_hard:
         raise RuntimeError(
@@ -1562,12 +1608,31 @@ def main(argv=None):
     filtered_complete = existing_filtered_count >= n_projected_points
     filter_config_ok = configs_equal(read_json(filter_config_file), filter_config)
 
-    if rerun_filtering_if_exists or force_downstream or not filtered_complete or not filter_config_ok:
+    if rerun_filtering_if_exists:
+        print("   AVISO puntos filtrados: forzado por configuración.")
+        run_filtering = True
+    elif not filtered_complete:
         print(
             f"   AVISO puntos filtrados: {existing_filtered_count}/{n_projected_points}. "
-            "Se recalculará."
+            "Se recalculará porque faltan outputs."
         )
+        run_filtering = True
+    elif force_downstream or not filter_config_ok:
+        print(
+            f"   AVISO puntos filtrados: completos ({existing_filtered_count}/{n_projected_points}). "
+            "Se reutilizan aunque haya cambiado la configuración. "
+            "Usa --rerun-filtering si quieres recalcularlos."
+        )
+        write_json(filter_config_file, filter_config)
+        run_filtering = False
+    else:
+        print(
+            f"   Se omite filter_points: puntos filtrados suficientes "
+            f"({existing_filtered_count}/{n_projected_points})."
+        )
+        run_filtering = False
 
+    if run_filtering:
         remove_points_in_range(filtered_points_dir, start_id, end_id, "puntos filtrados")
         filter_config_file.unlink(missing_ok=True)
 
@@ -1609,11 +1674,6 @@ def main(argv=None):
 
         write_json(filter_config_file, filter_config)
         force_downstream = True
-    else:
-        print(
-            f"   Se omite filter_points: puntos filtrados suficientes "
-            f"({existing_filtered_count}/{n_projected_points})."
-        )
 
     n_filtered_points = count_points_in_range(filtered_points_dir, start_id, end_id)
     print(f"   Frames con puntos filtrados: {n_filtered_points}/{n_images}")
