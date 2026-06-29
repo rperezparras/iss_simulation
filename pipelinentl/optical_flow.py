@@ -3,23 +3,28 @@
 """
 Cálculo de flujo óptico entre imágenes ISS georreferenciadas y VIIRS.
 
-Para cada imagen georreferenciada:
-  1. Lee la imagen ISS *_rect.tiff desde geo_dir.
-  2. Lee la imagen VIIRS correspondiente *_viirs.tiff desde viirs_dir.
-  3. Redimensiona VIIRS a la resolución de la ISS georreferenciada.
-  4. Preprocesa ISS/VIIRS y calcula flujo óptico Farneback sobre una ROI.
-  5. Guarda:
-       - *_flow.npy       : campo de flujo en coordenadas de la ROI.
-       - *_flow_meta.json : metadatos exactos de la ROI dentro del GeoTIFF.
+El flujo se calcula en dirección ISS -> VIIRS, para poder corregir directamente
+los GCPs muestreados en la imagen ISS ya georreferenciada.
 
-El JSON de metadatos es necesario para que correct_points.py pueda aplicar el
-flujo en el sistema de coordenadas correcto sin inferencias ambiguas.
+Soporta dos tipos de VIIRS de entrada:
+
+1) VIIRS alineado a una ROI exacta, generado por viirs_roi_crop.py con
+   --roi_mode gcp --align roi_exact. En este caso existe un
+   <image_id>_roi.json y el GeoTIFF VIIRS ya tiene exactamente la rejilla de
+   esa ROI. NO se debe redimensionar a la imagen ISS completa.
+
+2) VIIRS alineado a la imagen completa o a una rejilla mínima antigua. En ese
+   caso se usa el comportamiento de compatibilidad: redimensionar VIIRS a la
+   resolución de la ISS y aplicar el recorte normalizado crop_*.
+
+Para cada imagen guarda:
+  - *_flow.npy       : campo de flujo en coordenadas de la ROI usada.
+  - *_flow_meta.json : metadatos exactos de la ROI dentro del GeoTIFF ISS.
 """
 
 import argparse
 import json
 import os
-from pathlib import Path
 
 import cv2
 import flow_vis
@@ -57,7 +62,7 @@ def normalized_crop_to_pixels(
     crop_y_start: float,
     crop_y_end: float,
 ) -> tuple[int, int, int, int]:
-    """Convierte crop normalizado [0,1] a píxeles usando la misma regla siempre."""
+    """Convierte crop normalizado [0,1] a píxeles. Devuelve x0,y0,x1,y1."""
     if width <= 0 or height <= 0:
         raise ValueError(f"Dimensiones inválidas: width={width}, height={height}")
 
@@ -84,6 +89,60 @@ def normalized_crop_to_pixels(
     return x0, y0, x1, y1
 
 
+def roi_json_path_from_viirs_file(viirs_file: str) -> str:
+    """Devuelve el path esperado de <image_id>_roi.json junto al *_viirs.tiff."""
+    if viirs_file.endswith("_viirs.tiff"):
+        return viirs_file.replace("_viirs.tiff", "_roi.json")
+    if viirs_file.endswith("_viirs.tif"):
+        return viirs_file.replace("_viirs.tif", "_roi.json")
+    return os.path.splitext(viirs_file)[0] + "_roi.json"
+
+
+def load_roi_from_viirs_json(viirs_file: str, full_width: int, full_height: int):
+    """
+    Lee <image_id>_roi.json generado por viirs_roi_crop.py.
+
+    Devuelve (x0, y0, x1, y1, roi_source) o None si no hay JSON utilizable.
+    El JSON de viirs_roi_crop.py guarda x0,x1,y0,y1 con x1/y1 exclusivos.
+    """
+    roi_json = roi_json_path_from_viirs_file(viirs_file)
+    if not os.path.exists(roi_json):
+        return None
+
+    with open(roi_json, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    required = {"x0", "x1", "y0", "y1"}
+    if not required.issubset(meta):
+        return None
+
+    x0 = int(meta["x0"])
+    x1 = int(meta["x1"])
+    y0 = int(meta["y0"])
+    y1 = int(meta["y1"])
+
+    x0 = max(0, min(x0, full_width - 1))
+    x1 = max(x0 + 1, min(x1, full_width))
+    y0 = max(0, min(y0, full_height - 1))
+    y1 = max(y0 + 1, min(y1, full_height))
+
+    return x0, y0, x1, y1, f"viirs_roi_json:{os.path.basename(roi_json)}"
+
+
+def to_uint8_normalized(arr: np.ndarray, label: str) -> np.ndarray:
+    """Normaliza un array a uint8 [0,255] de forma robusta."""
+    arr = np.asarray(arr, dtype=np.float32)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    vmax = float(np.max(arr))
+    vmin = float(np.min(arr))
+    if vmax <= vmin:
+        raise ValueError(f"{label} no tiene rango dinámico útil: min={vmin}, max={vmax}")
+
+    out = (arr - vmin) / (vmax - vmin + 1e-9) * 255.0
+    return np.uint8(np.clip(out, 0, 255))
+
+
 def write_flow_metadata(
     meta_path: str,
     image_id: str,
@@ -99,9 +158,12 @@ def write_flow_metadata(
     crop_x_end: float,
     crop_y_start: float,
     crop_y_end: float,
+    roi_source: str,
+    viirs_width: int,
+    viirs_height: int,
 ):
     meta = {
-        "metadata_version": 1,
+        "metadata_version": 3,
         "image_id": image_id,
         "iss_rect_tiff": os.path.abspath(iss_file),
         "viirs_tiff": os.path.abspath(viirs_file),
@@ -113,17 +175,46 @@ def write_flow_metadata(
         "y1": int(y1),
         "flow_width": int(x1 - x0),
         "flow_height": int(y1 - y0),
+        "viirs_input_width": int(viirs_width),
+        "viirs_input_height": int(viirs_height),
+        "roi_source": str(roi_source),
         "crop_x_start": float(crop_x_start),
         "crop_x_end": float(crop_x_end),
         "crop_y_start": float(crop_y_start),
         "crop_y_end": float(crop_y_end),
-        "flow_definition": "cv2.calcOpticalFlowFarneback(reference_viirs, distorted_iss)",
-        "correction_to_apply_in_correct_points": "new_pixel = old_pixel - flow[y, x]",
+        "flow_definition": "cv2.calcOpticalFlowFarneback(reference_iss, distorted_viirs)",
+        "correction_to_apply_in_correct_points": "new_pixel = old_pixel + flow[y, x]",
         "farneback_params": FARNEBACK_PARAMS,
     }
 
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
+
+
+def compute_flow(reference_u8: np.ndarray, distorted_u8: np.ndarray) -> np.ndarray:
+    """Calcula Farneback tras validar tamaños y tipos."""
+    if reference_u8.shape != distorted_u8.shape:
+        raise ValueError(
+            f"reference y distorted deben tener el mismo tamaño, recibido "
+            f"{reference_u8.shape} vs {distorted_u8.shape}"
+        )
+    if reference_u8.dtype != np.uint8:
+        reference_u8 = np.uint8(np.clip(reference_u8, 0, 255))
+    if distorted_u8.dtype != np.uint8:
+        distorted_u8 = np.uint8(np.clip(distorted_u8, 0, 255))
+
+    return cv2.calcOpticalFlowFarneback(
+        reference_u8,
+        distorted_u8,
+        None,
+        FARNEBACK_PARAMS["pyr_scale"],
+        FARNEBACK_PARAMS["levels"],
+        FARNEBACK_PARAMS["winsize"],
+        FARNEBACK_PARAMS["iterations"],
+        FARNEBACK_PARAMS["poly_n"],
+        FARNEBACK_PARAMS["poly_sigma"],
+        FARNEBACK_PARAMS["flags"],
+    )
 
 
 def compute_and_save_optical_flow(
@@ -161,44 +252,62 @@ def compute_and_save_optical_flow(
             viirs = src.read(1)
 
         viirs = np.nan_to_num(viirs, nan=0.0, posinf=0.0, neginf=0.0)
+        viirs_input_h, viirs_input_w = viirs.shape[:2]
         full_height, full_width = iss.shape[:2]
-        viirs = cv2.resize(viirs, (full_width, full_height), interpolation=cv2.INTER_LINEAR)
 
-        vmax = float(np.max(viirs))
-        if vmax <= 0:
-            raise ValueError(f"VIIRS para {image_id} tiene máximo <= 0; no se puede normalizar.")
-        viirs_u8 = np.uint8(np.clip(viirs / vmax * 255.0, 0, 255))
+        iss_gray_full = cv2.cvtColor(iss, cv2.COLOR_RGB2GRAY)
 
-        iss_gray = cv2.cvtColor(iss, cv2.COLOR_RGB2GRAY)
-        iss_gray_matched = exposure.match_histograms(iss_gray, viirs_u8)
-        iss_gray_matched = np.asarray(iss_gray_matched)
-        if iss_gray_matched.dtype != np.uint8:
-            iss_gray_matched = np.uint8(np.clip(iss_gray_matched, 0, 255))
+        roi_from_json = load_roi_from_viirs_json(viirs_file, full_width, full_height)
 
-        x0, y0, x1, y1 = normalized_crop_to_pixels(
-            full_width,
-            full_height,
-            crop_x_start,
-            crop_x_end,
-            crop_y_start,
-            crop_y_end,
-        )
+        if roi_from_json is not None:
+            # Caso correcto para viirs_roi_crop.py --roi_mode gcp --align roi_exact:
+            # el VIIRS ya está en la rejilla exacta de la ROI, así que NO se
+            # redimensiona a la imagen completa.
+            x0, y0, x1, y1, roi_source = roi_from_json
+            roi_w = x1 - x0
+            roi_h = y1 - y0
 
-        reference_crop = viirs_u8[y0:y1, x0:x1]
-        distorted_crop = iss_gray_matched[y0:y1, x0:x1]
+            if viirs_input_w != roi_w or viirs_input_h != roi_h:
+                print(
+                    f"AVISO {image_id}: tamaño VIIRS ROI {viirs_input_w}x{viirs_input_h} "
+                    f"no coincide con roi_json {roi_w}x{roi_h}. Se redimensiona solo a la ROI."
+                )
+                viirs_roi = cv2.resize(viirs, (roi_w, roi_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                viirs_roi = viirs
 
-        flow = cv2.calcOpticalFlowFarneback(
-            reference_crop,
-            distorted_crop,
-            None,
-            FARNEBACK_PARAMS["pyr_scale"],
-            FARNEBACK_PARAMS["levels"],
-            FARNEBACK_PARAMS["winsize"],
-            FARNEBACK_PARAMS["iterations"],
-            FARNEBACK_PARAMS["poly_n"],
-            FARNEBACK_PARAMS["poly_sigma"],
-            FARNEBACK_PARAMS["flags"],
-        )
+            iss_roi = iss_gray_full[y0:y1, x0:x1]
+            viirs_u8 = to_uint8_normalized(viirs_roi, f"VIIRS {image_id}")
+            iss_matched = exposure.match_histograms(iss_roi, viirs_u8)
+            iss_u8 = np.uint8(np.clip(iss_matched, 0, 255))
+
+            # Para corregir GCPs de la ISS georreferenciada necesitamos el
+            # flujo ISS -> VIIRS. Cada GCP se muestrea en coordenadas de la
+            # ISS ya georreferenciada y se desplaza hacia la referencia VIIRS.
+            reference_crop = iss_u8
+            distorted_crop = viirs_u8
+
+        else:
+            # Compatibilidad con flujos antiguos o VIIRS alineado a imagen completa.
+            roi_source = "normalized_crop_args_full_frame"
+            viirs_full = cv2.resize(viirs, (full_width, full_height), interpolation=cv2.INTER_LINEAR)
+            viirs_u8_full = to_uint8_normalized(viirs_full, f"VIIRS {image_id}")
+            iss_matched_full = exposure.match_histograms(iss_gray_full, viirs_u8_full)
+            iss_u8_full = np.uint8(np.clip(iss_matched_full, 0, 255))
+
+            x0, y0, x1, y1 = normalized_crop_to_pixels(
+                full_width,
+                full_height,
+                crop_x_start,
+                crop_x_end,
+                crop_y_start,
+                crop_y_end,
+            )
+            # Fallback coherente con la rama ROI-aware: flujo ISS -> VIIRS.
+            reference_crop = iss_u8_full[y0:y1, x0:x1]
+            distorted_crop = viirs_u8_full[y0:y1, x0:x1]
+
+        flow = compute_flow(reference_crop, distorted_crop)
 
         os.makedirs(flow_dir, exist_ok=True)
         np.save(flow_outfile, flow)
@@ -217,11 +326,15 @@ def compute_and_save_optical_flow(
             crop_x_end=crop_x_end,
             crop_y_start=crop_y_start,
             crop_y_end=crop_y_end,
+            roi_source=roi_source,
+            viirs_width=viirs_input_w,
+            viirs_height=viirs_input_h,
         )
 
         print(
             f"✅ Flujo guardado: {flow_outfile} | "
-            f"ROI x={x0}:{x1}, y={y0}:{y1}, size={x1 - x0}x{y1 - y0}"
+            f"ROI x={x0}:{x1}, y={y0}:{y1}, "
+            f"size={x1 - x0}x{y1 - y0}, source={roi_source}"
         )
 
         if show_plot:
@@ -241,7 +354,11 @@ def compute_and_save_optical_flow(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Cálculo de flujo óptico entre imágenes ISS georreferenciadas y VIIRS."
+        description=(
+            "Cálculo de flujo óptico entre imágenes ISS georreferenciadas y VIIRS. "
+            "El flujo se calcula en dirección ISS -> VIIRS, para poder corregir "
+            "directamente los GCPs muestreados en la imagen ISS ya georreferenciada."
+        )
     )
     parser.add_argument("--geo_dir", type=str, required=True)
     parser.add_argument("--viirs_dir", type=str, required=True)

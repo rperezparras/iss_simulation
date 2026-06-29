@@ -1,24 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Correct .points using optical flow sampled at the original GCP positions.
+No dense synthetic points. No magnitude limit by default.
 """
-Corrección de puntos usando flujo óptico.
-
-Entrada:
-  - filtered_points/*.points
-  - flow/*_flow.npy
-  - flow/*_flow_meta.json, generado por optical_flow.py
-  - geo/*_pixel_mapping.csv y geo/*_rect.tiff
-
-El flujo óptico puede estar calculado sobre una ROI del GeoTIFF. Por eso este
-script lee el *_flow_meta.json para conocer el origen exacto de esa ROI. Si el
-metadato no existe, se conserva un fallback compatible con versiones antiguas.
-"""
-
-import argparse
-import json
-import os
+import argparse, json, os, re
 from pathlib import Path
-
 import numpy as np
 import pandas as pd
 from osgeo import gdal
@@ -26,389 +12,220 @@ from osgeo import gdal
 gdal.UseExceptions()
 
 
-def extract_id_from_filename(filename: str):
-    """Extrae el ID numérico final de nombres tipo 'ISS067-E-201283.points'."""
-    try:
-        base = os.path.splitext(os.path.basename(filename))[0]
-        return int(base.split("-")[-1])
-    except Exception:
+def extract_id(name):
+    m = re.search(r"(\d{5,8})", os.path.basename(name))
+    return int(m.group(1)) if m else None
+
+
+def meta_path(flow_path):
+    p = Path(flow_path)
+    return p.with_name(p.name.replace("_flow.npy", "_flow_meta.json"))
+
+
+def pixel_to_geo(px, py, gt):
+    return gt[0] + px * gt[1] + py * gt[2], gt[3] + px * gt[4] + py * gt[5]
+
+
+def sign_from_meta(meta):
+    corr = str(meta.get("correction_to_apply_in_correct_points", "")).lower()
+    fdef = str(meta.get("flow_definition", "")).lower()
+    if "old_pixel + flow" in corr:
+        return 1.0
+    if "old_pixel - flow" in corr:
+        return -1.0
+    if "reference_iss" in fdef and "distorted_viirs" in fdef:
+        return 1.0
+    if "reference_viirs" in fdef and "distorted_iss" in fdef:
+        return -1.0
+    return 1.0
+
+
+def bilinear(flow, x, y):
+    h, w = flow.shape[:2]
+    if not np.isfinite(x) or not np.isfinite(y) or x < 0 or y < 0 or x > w - 1 or y > h - 1:
         return None
+    x0, y0 = int(np.floor(x)), int(np.floor(y))
+    x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
+    wx, wy = x - x0, y - y0
+    f00 = flow[y0, x0].astype(float)
+    f10 = flow[y0, x1].astype(float)
+    f01 = flow[y1, x0].astype(float)
+    f11 = flow[y1, x1].astype(float)
+    return (1-wy)*((1-wx)*f00 + wx*f10) + wy*((1-wx)*f01 + wx*f11)
 
 
-def pixel_to_geo(px: float, py: float, geotransform):
-    """Convierte píxel (col=px, fila=py) a coordenadas geográficas."""
-    map_x = geotransform[0] + px * geotransform[1] + py * geotransform[2]
-    map_y = geotransform[3] + px * geotransform[4] + py * geotransform[5]
-    return map_x, map_y
+def correct_one(points_path, flow_path, mapping_path, geo_path, out_path,
+                cli_sign=None, use_cli_sign=False,
+                max_correction_px=0.0, enable_max_filter=False):
+    pts = pd.read_csv(points_path, comment="M")
+    mp = pd.read_csv(mapping_path)
 
+    for c in ["mapX", "mapY", "sourceX", "sourceY"]:
+        if c not in pts.columns:
+            raise ValueError(f"Missing column {c} in {points_path}")
+    for c in ["geoX", "geoY"]:
+        if c not in mp.columns:
+            raise ValueError(f"Missing column {c} in {mapping_path}")
 
-def normalized_crop_to_pixels(
-    width: int,
-    height: int,
-    crop_x_start: float,
-    crop_x_end: float,
-    crop_y_start: float,
-    crop_y_end: float,
-) -> tuple[int, int, int, int]:
-    """Misma conversión que en optical_flow.py. Devuelve x0, y0, x1, y1."""
-    crop_x_start = max(0.0, min(1.0, float(crop_x_start)))
-    crop_x_end = max(0.0, min(1.0, float(crop_x_end)))
-    crop_y_start = max(0.0, min(1.0, float(crop_y_start)))
-    crop_y_end = max(0.0, min(1.0, float(crop_y_end)))
-
-    if crop_x_end <= crop_x_start:
-        raise ValueError("crop_x_end debe ser mayor que crop_x_start")
-    if crop_y_end <= crop_y_start:
-        raise ValueError("crop_y_end debe ser mayor que crop_y_start")
-
-    x0 = int(width * crop_x_start)
-    x1 = int(width * crop_x_end)
-    y0 = int(height * crop_y_start)
-    y1 = int(height * crop_y_end)
-
-    x0 = max(0, min(x0, width - 1))
-    x1 = max(x0 + 1, min(x1, width))
-    y0 = max(0, min(y0, height - 1))
-    y1 = max(y0 + 1, min(y1, height))
-
-    return x0, y0, x1, y1
-
-
-def flow_meta_path_from_flow_path(flow_path: str) -> str:
-    path = Path(flow_path)
-    name = path.name
-    if name.endswith("_flow.npy"):
-        return str(path.with_name(name.replace("_flow.npy", "_flow_meta.json")))
-    return str(path.with_suffix(".json"))
-
-
-def infer_roi_from_mapping(mapping: pd.DataFrame, flow_w: int, flow_h: int, width: int, height: int):
-    """
-    Fallback para flujos antiguos sin JSON: infiere una ROI centrada en los GCPs.
-    Se usa sólo para compatibilidad; la ruta robusta es leer *_flow_meta.json.
-    """
-    gx = pd.to_numeric(mapping["geoX"], errors="coerce").dropna().to_numpy(dtype=float)
-    gy = pd.to_numeric(mapping["geoY"], errors="coerce").dropna().to_numpy(dtype=float)
-    if gx.size == 0 or gy.size == 0:
-        raise ValueError("No se pudo inferir la ROI: geoX/geoY no contienen valores válidos.")
-
-    cx = 0.5 * (float(gx.min()) + float(gx.max()))
-    cy = 0.5 * (float(gy.min()) + float(gy.max()))
-
-    x0 = int(round(cx - 0.5 * flow_w))
-    y0 = int(round(cy - 0.5 * flow_h))
-    x0 = max(0, min(x0, max(0, width - flow_w)))
-    y0 = max(0, min(y0, max(0, height - flow_h)))
-    x1 = x0 + flow_w
-    y1 = y0 + flow_h
-    return x0, y0, x1, y1
-
-
-def get_flow_roi(
-    flow_path: str,
-    flow: np.ndarray,
-    width: int,
-    height: int,
-    mapping: pd.DataFrame,
-    crop_x_start: float,
-    crop_x_end: float,
-    crop_y_start: float,
-    crop_y_end: float,
-):
-    """
-    Devuelve x0, y0, x1, y1 y origen de la información.
-
-    Prioridad:
-      1. *_flow_meta.json, robusto y exacto.
-      2. crop_* de CLI si coinciden con el tamaño del flujo.
-      3. inferencia desde pixel_mapping.csv para compatibilidad con flujos viejos.
-    """
-    flow_h, flow_w = flow.shape[:2]
-    meta_path = flow_meta_path_from_flow_path(flow_path)
-
-    if os.path.exists(meta_path):
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-
-        x0 = int(meta["x0"])
-        y0 = int(meta["y0"])
-        x1 = int(meta["x1"])
-        y1 = int(meta["y1"])
-
-        meta_flow_w = int(meta.get("flow_width", x1 - x0))
-        meta_flow_h = int(meta.get("flow_height", y1 - y0))
-        meta_full_w = int(meta.get("full_width", width))
-        meta_full_h = int(meta.get("full_height", height))
-
-        if meta_flow_w != flow_w or meta_flow_h != flow_h:
-            raise ValueError(
-                f"Metadatos incompatibles con {os.path.basename(flow_path)}: "
-                f"meta={meta_flow_w}x{meta_flow_h}, flow={flow_w}x{flow_h}."
-            )
-
-        if meta_full_w != width or meta_full_h != height:
-            raise ValueError(
-                f"El flujo fue calculado sobre un GeoTIFF de tamaño "
-                f"{meta_full_w}x{meta_full_h}, pero el GeoTIFF actual mide "
-                f"{width}x{height}. Recalcula optical_flow para esta geo/."
-            )
-
-        if x1 - x0 != flow_w or y1 - y0 != flow_h:
-            raise ValueError(
-                f"ROI incompatible con el flujo: ROI={x1 - x0}x{y1 - y0}, "
-                f"flow={flow_w}x{flow_h}."
-            )
-
-        return x0, y0, x1, y1, "metadata"
-
-    # Fallback antiguo: usar crop_* si da exactamente el tamaño del flujo.
-    x0, y0, x1, y1 = normalized_crop_to_pixels(
-        width,
-        height,
-        crop_x_start,
-        crop_x_end,
-        crop_y_start,
-        crop_y_end,
-    )
-    if (x1 - x0) == flow_w and (y1 - y0) == flow_h:
-        return x0, y0, x1, y1, "crop_args"
-
-    # Último recurso para no perder ejecuciones antiguas.
-    x0, y0, x1, y1 = infer_roi_from_mapping(mapping, flow_w, flow_h, width, height)
-    print(
-        f"⚠️ Flujo sin *_flow_meta.json y crop_* no coincide. "
-        f"Se infiere ROI x={x0}:{x1}, y={y0}:{y1}. "
-        "Para resultados reproducibles, recalcula optical_flow.py con la versión nueva."
-    )
-    return x0, y0, x1, y1, "inferred_from_mapping"
-
-
-def correct_points_with_flow(
-    points_path: str,
-    flow_path: str,
-    mapping_file: str,
-    geo_image_path: str,
-    corrected_points_path: str,
-    crop_x_start: float,
-    crop_x_end: float,
-    crop_y_start: float,
-    crop_y_end: float,
-):
-    """Corrige un .points usando el flujo óptico y el pixel_mapping.csv."""
-    points = pd.read_csv(points_path)
-    mapping = pd.read_csv(mapping_file)
-
-    required_mapping_cols = {"geoX", "geoY"}
-    missing = required_mapping_cols - set(mapping.columns)
-    if missing:
-        raise ValueError(f"El mapping no contiene columnas {sorted(missing)}: {mapping_file}")
-
-    required_point_cols = {"mapX", "mapY", "sourceX", "sourceY"}
-    missing_points = required_point_cols - set(points.columns)
-    if missing_points:
-        raise ValueError(f"El .points no contiene columnas {sorted(missing_points)}: {points_path}")
-
-    if len(mapping) != len(points):
-        n = min(len(mapping), len(points))
-        print(
-            f"⚠️ Aviso: mapping ({len(mapping)}) y points ({len(points)}) tienen distinta "
-            f"longitud. Se usarán los primeros {n} registros por índice."
-        )
-        points = points.iloc[:n].copy()
-        mapping = mapping.iloc[:n].copy()
+    if len(pts) != len(mp):
+        n = min(len(pts), len(mp))
+        print(f"AVISO {Path(points_path).name}: points={len(pts)}, mapping={len(mp)}; using first {n}")
+        pts = pts.iloc[:n].copy()
+        mp = mp.iloc[:n].copy()
     else:
-        points = points.copy()
-        mapping = mapping.copy()
-
-    if len(points) == 0:
-        raise ValueError(f"No hay puntos válidos en {points_path}")
+        pts = pts.copy(); mp = mp.copy()
 
     flow = np.load(flow_path)
     if flow.ndim != 3 or flow.shape[2] != 2:
-        raise ValueError(f"El flujo debe tener forma (H, W, 2), recibido {flow.shape}: {flow_path}")
+        raise ValueError(f"Invalid flow shape {flow.shape}: {flow_path}")
 
-    dataset = gdal.Open(geo_image_path)
-    if dataset is None:
-        raise FileNotFoundError(f"No se pudo abrir la imagen georreferenciada: {geo_image_path}")
-    geotransform = dataset.GetGeoTransform()
-    width = int(dataset.RasterXSize)
-    height = int(dataset.RasterYSize)
+    mpath = meta_path(flow_path)
+    if not mpath.exists():
+        raise FileNotFoundError(f"Missing flow metadata: {mpath}")
+    meta = json.load(open(mpath, encoding="utf-8"))
 
-    x0, y0, x1, y1, roi_source = get_flow_roi(
-        flow_path=flow_path,
-        flow=flow,
-        width=width,
-        height=height,
-        mapping=mapping,
-        crop_x_start=crop_x_start,
-        crop_x_end=crop_x_end,
-        crop_y_start=crop_y_start,
-        crop_y_end=crop_y_end,
-    )
+    ds = gdal.Open(geo_path)
+    gt = ds.GetGeoTransform()
+    width, height = int(ds.RasterXSize), int(ds.RasterYSize)
 
-    geo_x = pd.to_numeric(mapping["geoX"], errors="coerce").to_numpy(dtype=float)
-    geo_y = pd.to_numeric(mapping["geoY"], errors="coerce").to_numpy(dtype=float)
+    x0, y0, x1, y1 = int(meta["x0"]), int(meta["y0"]), int(meta["x1"]), int(meta["y1"])
+    if int(meta.get("full_width", width)) != width or int(meta.get("full_height", height)) != height:
+        raise ValueError("Flow metadata full_width/full_height do not match current GeoTIFF")
+    if flow.shape[1] != x1 - x0 or flow.shape[0] != y1 - y0:
+        raise ValueError(f"Flow shape {flow.shape[:2]} does not match ROI {(y1-y0, x1-x0)}")
 
-    corrected_map_x = []
-    corrected_map_y = []
-    dx_values = []
-    dy_values = []
+    sign = float(cli_sign) if use_cli_sign and cli_sign is not None else sign_from_meta(meta)
+    sign_source = "cli" if use_cli_sign and cli_sign is not None else "flow_meta"
 
-    inside_flow_count = 0
-    nonzero_flow_count = 0
+    new_mapx, new_mapy = [], []
+    dxs, dys, rawdxs, rawdys, insides, applied, mags, reasons = [], [], [], [], [], [], [], []
 
-    for geo_x_pix, geo_y_pix in zip(geo_x, geo_y):
-        if not np.isfinite(geo_x_pix) or not np.isfinite(geo_y_pix):
-            dx_pix, dy_pix = 0.0, 0.0
-            new_geo_x_pix, new_geo_y_pix = geo_x_pix, geo_y_pix
+    for px, py, oldx, oldy in zip(pd.to_numeric(mp["geoX"], errors="coerce"),
+                                  pd.to_numeric(mp["geoY"], errors="coerce"),
+                                  pts["mapX"], pts["mapY"]):
+        dx = dy = rawdx = rawdy = 0.0
+        inside = app = 0
+        reason = "outside_flow_roi"
+        if np.isfinite(px) and np.isfinite(py):
+            f = bilinear(flow, float(px)-x0, float(py)-y0)
+            if f is not None:
+                inside = 1
+                rawdx, rawdy = sign*float(f[0]), sign*float(f[1])
+                mag = float(np.hypot(rawdx, rawdy))
+                if enable_max_filter and max_correction_px > 0 and mag > max_correction_px:
+                    reason = "too_large_filtered"
+                else:
+                    dx, dy = rawdx, rawdy
+                    app = int(mag > 1e-9)
+                    reason = "applied" if app else "zero_flow"
+            mx, my = pixel_to_geo(float(px)+dx, float(py)+dy, gt)
         else:
-            x_int = int(round(float(geo_x_pix)))
-            y_int = int(round(float(geo_y_pix)))
-            rel_x = x_int - x0
-            rel_y = y_int - y0
+            mx, my = oldx, oldy
+            reason = "non_finite_mapping_pixel"
+        new_mapx.append(mx); new_mapy.append(my)
+        dxs.append(dx); dys.append(dy); rawdxs.append(rawdx); rawdys.append(rawdy)
+        insides.append(inside); applied.append(app); mags.append(float(np.hypot(dx,dy))); reasons.append(reason)
 
-            if 0 <= rel_x < flow.shape[1] and 0 <= rel_y < flow.shape[0]:
-                inside_flow_count += 1
-                dx_pix, dy_pix = -flow[rel_y, rel_x]
-                dx_pix = float(dx_pix)
-                dy_pix = float(dy_pix)
-                if abs(dx_pix) > 1e-6 or abs(dy_pix) > 1e-6:
-                    nonzero_flow_count += 1
-                new_geo_x_pix = float(geo_x_pix) + dx_pix
-                new_geo_y_pix = float(geo_y_pix) + dy_pix
-            else:
-                dx_pix, dy_pix = 0.0, 0.0
-                new_geo_x_pix, new_geo_y_pix = float(geo_x_pix), float(geo_y_pix)
+    out = pd.DataFrame({
+        "mapX": new_mapx,
+        "mapY": new_mapy,
+        "sourceX": pts["sourceX"].to_numpy(),
+        "sourceY": pts["sourceY"].to_numpy(),
+        "enable": pts["enable"].to_numpy() if "enable" in pts.columns else np.ones(len(pts), dtype=int),
+        "dX": dxs,
+        "dY": dys,
+        "residual": np.zeros(len(pts)),
+        "dX_raw": rawdxs,
+        "dY_raw": rawdys,
+        "correction_mag": mags,
+        "flow_inside": insides,
+        "flow_applied": applied,
+        "correction_reason": reasons,
+        "geoX_first": pd.to_numeric(mp["geoX"], errors="coerce").to_numpy(),
+        "geoY_first": pd.to_numeric(mp["geoY"], errors="coerce").to_numpy(),
+    })
 
-        new_map_x, new_map_y = pixel_to_geo(new_geo_x_pix, new_geo_y_pix, geotransform)
-        corrected_map_x.append(new_map_x)
-        corrected_map_y.append(new_map_y)
-        dx_values.append(dx_pix)
-        dy_values.append(dy_pix)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out.to_csv(out_path, index=False)
 
-    points["mapX"] = corrected_map_x
-    points["mapY"] = corrected_map_y
-    points["dX"] = dx_values
-    points["dY"] = dy_values
-    points["residual"] = 0.0
-    points["enable"] = 1
-
-    output_cols = ["mapX", "mapY", "sourceX", "sourceY", "enable", "dX", "dY", "residual"]
-    output = points[output_cols]
-
-    os.makedirs(os.path.dirname(corrected_points_path), exist_ok=True)
-    output.to_csv(corrected_points_path, index=False)
-
+    arr = np.asarray(mags, float)
     stats = {
-        "points_file": os.path.abspath(points_path),
-        "flow_file": os.path.abspath(flow_path),
-        "mapping_file": os.path.abspath(mapping_file),
-        "geo_image": os.path.abspath(geo_image_path),
-        "output_file": os.path.abspath(corrected_points_path),
-        "n_points": int(len(points)),
-        "inside_flow_count": int(inside_flow_count),
-        "inside_flow_percent": float(100.0 * inside_flow_count / len(points)),
-        "nonzero_flow_count": int(nonzero_flow_count),
-        "nonzero_flow_percent": float(100.0 * nonzero_flow_count / len(points)),
-        "roi_source": roi_source,
-        "roi": {
-            "x0": int(x0),
-            "y0": int(y0),
-            "x1": int(x1),
-            "y1": int(y1),
-            "width": int(x1 - x0),
-            "height": int(y1 - y0),
+        "mode": "original_points_only_exact_flow_sample",
+        "no_dense_points_added": True,
+        "no_max_pixel_limit_applied": not bool(enable_max_filter),
+        "flow_sign_used": sign,
+        "flow_sign_source": sign_source,
+        "flow_sign_cli_received": cli_sign,
+        "n_points": int(len(out)),
+        "inside_flow_count": int(np.sum(insides)),
+        "applied_count": int(np.sum(applied)),
+        "reason_counts": {str(k): int(v) for k, v in pd.Series(reasons).value_counts().to_dict().items()},
+        "roi": {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "width": x1-x0, "height": y1-y0},
+        "flow_definition": meta.get("flow_definition"),
+        "flow_correction": meta.get("correction_to_apply_in_correct_points"),
+        "correction_mag_percentiles": {
+            "p50": float(np.percentile(arr, 50)),
+            "p90": float(np.percentile(arr, 90)),
+            "p95": float(np.percentile(arr, 95)),
+            "max": float(np.max(arr)),
         },
-        "full_width": int(width),
-        "full_height": int(height),
     }
-
-    stats_path = corrected_points_path.replace("_corrected.points", "_correction_stats.json")
-    with open(stats_path, "w", encoding="utf-8") as f:
-        json.dump(stats, f, indent=2, ensure_ascii=False)
-
-    print(
-        f"✅ Corregido: {corrected_points_path} | "
-        f"inside_flow={inside_flow_count}/{len(points)} "
-        f"({100.0 * inside_flow_count / len(points):.1f}%), "
-        f"nonzero={nonzero_flow_count}/{len(points)} "
-        f"({100.0 * nonzero_flow_count / len(points):.1f}%), "
-        f"ROI={roi_source} x={x0}:{x1}, y={y0}:{y1}"
-    )
+    sp = out_path.replace("_corrected.points", "_correction_stats.json")
+    json.dump(stats, open(sp, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
+    print(f"OK {out_path} | simple original points | inside={stats['inside_flow_count']}/{stats['n_points']} | applied={stats['applied_count']}/{stats['n_points']} | sign={sign} ({sign_source})")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Corrección de puntos con flujo óptico.")
-    parser.add_argument("--input_points_dir", type=str, required=True)
-    parser.add_argument("--flow_dir", type=str, required=True)
-    parser.add_argument("--geo_dir", type=str, required=True)
-    parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--start_id", type=int, required=True)
-    parser.add_argument("--end_id", type=int, required=True)
-    parser.add_argument("--crop_x_start", type=float, default=0.0)
-    parser.add_argument("--crop_x_end", type=float, default=1.0)
-    parser.add_argument("--crop_y_start", type=float, default=0.0)
-    parser.add_argument("--crop_y_end", type=float, default=1.0)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input_points_dir", required=True)
+    ap.add_argument("--flow_dir", required=True)
+    ap.add_argument("--geo_dir", required=True)
+    ap.add_argument("--output_dir", required=True)
+    ap.add_argument("--start_id", type=int, required=True)
+    ap.add_argument("--end_id", type=int, required=True)
+    ap.add_argument("--crop_x_start", type=float, default=0.0)  # legacy ignored when meta exists
+    ap.add_argument("--crop_x_end", type=float, default=1.0)
+    ap.add_argument("--crop_y_start", type=float, default=0.0)
+    ap.add_argument("--crop_y_end", type=float, default=1.0)
+    ap.add_argument("--flow_sign", type=float, default=None)  # ignored unless --use_cli_flow_sign
+    ap.add_argument("--use_cli_flow_sign", action="store_true")
+    ap.add_argument("--max_correction_px", type=float, default=0.0)  # ignored unless --enable_max_correction_filter
+    ap.add_argument("--enable_max_correction_filter", action="store_true")
+    ap.add_argument("--clip_correction", action="store_true")  # legacy ignored
+    args = ap.parse_args()
 
-    args = parser.parse_args()
-
-    input_points_dir = os.path.abspath(args.input_points_dir)
-    flow_dir = os.path.abspath(args.flow_dir)
-    geo_dir = os.path.abspath(args.geo_dir)
-    output_dir = os.path.abspath(args.output_dir)
-    os.makedirs(output_dir, exist_ok=True)
-
-    all_point_files = sorted(f for f in os.listdir(input_points_dir) if f.endswith(".points"))
-    selected_files = []
-    for fname in all_point_files:
-        file_id = extract_id_from_filename(fname)
-        if file_id is not None and args.start_id <= file_id <= args.end_id:
-            selected_files.append(fname)
-
-    print(f"🔵 Archivos .points a procesar en rango [{args.start_id}, {args.end_id}]: {len(selected_files)}")
-
-    processed = 0
-    failed = 0
-    for fname in selected_files:
-        base_name = os.path.splitext(fname)[0]
-        points_path = os.path.join(input_points_dir, fname)
-        flow_path = os.path.join(flow_dir, f"{base_name}_flow.npy")
-        mapping_file = os.path.join(geo_dir, f"{base_name}_pixel_mapping.csv")
-        geo_image_path = os.path.join(geo_dir, f"{base_name}_rect.tiff")
-        corrected_points_path = os.path.join(output_dir, f"{base_name}_corrected.points")
-
-        missing = [
-            ("flujo óptico", flow_path),
-            ("pixel_mapping.csv", mapping_file),
-            ("imagen georreferenciada", geo_image_path),
-        ]
-        missing = [(label, path) for label, path in missing if not os.path.exists(path)]
-        if missing:
-            for label, path in missing:
-                print(f"⚠️ Sin {label} para {base_name}, se omite: {path}")
+    os.makedirs(args.output_dir, exist_ok=True)
+    files = []
+    for f in sorted(os.listdir(args.input_points_dir)):
+        if not f.endswith(".points"):
             continue
+        sid = extract_id(f)
+        if sid is not None and args.start_id <= sid <= args.end_id:
+            files.append(f)
+    print(f"Archivos .points a procesar: {len(files)}")
+    print("Modo correct_points: original points only, exact optical-flow displacement, no dense points, no limit by default")
 
+    errors = 0
+    for f in files:
+        base = os.path.splitext(f)[0]
         try:
-            correct_points_with_flow(
-                points_path=points_path,
-                flow_path=flow_path,
-                mapping_file=mapping_file,
-                geo_image_path=geo_image_path,
-                corrected_points_path=corrected_points_path,
-                crop_x_start=args.crop_x_start,
-                crop_x_end=args.crop_x_end,
-                crop_y_start=args.crop_y_start,
-                crop_y_end=args.crop_y_end,
+            correct_one(
+                os.path.join(args.input_points_dir, f),
+                os.path.join(args.flow_dir, base + "_flow.npy"),
+                os.path.join(args.geo_dir, base + "_pixel_mapping.csv"),
+                os.path.join(args.geo_dir, base + "_rect.tiff"),
+                os.path.join(args.output_dir, base + "_corrected.points"),
+                cli_sign=args.flow_sign,
+                use_cli_sign=args.use_cli_flow_sign,
+                max_correction_px=float(args.max_correction_px),
+                enable_max_filter=args.enable_max_correction_filter,
             )
-            processed += 1
         except Exception as e:
-            failed += 1
-            print(f"❌ Error corrigiendo {base_name}: {e}")
-
-    print(f"✅ Corrección de puntos completada. Procesados: {processed}. Errores: {failed}.")
-    if failed > 0:
+            errors += 1
+            print(f"ERROR {base}: {e}")
+    print(f"Correccion terminada. Errores: {errors}")
+    if errors:
         raise SystemExit(1)
-
 
 if __name__ == "__main__":
     main()

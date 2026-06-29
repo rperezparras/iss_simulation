@@ -623,6 +623,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--flow-crop-x-end", type=float, default=1.0)
     g.add_argument("--flow-crop-y-start", type=float, default=0.0)
     g.add_argument("--flow-crop-y-end", type=float, default=1.0)
+    g.add_argument(
+        "--flow-correction-sign",
+        type=float,
+        default=-1.0,
+        help="Signo aplicado al flujo al corregir GCPs. Si el flujo se calcula VIIRS->ISS, normalmente es -1.",
+    )
+    g.add_argument(
+        "--flow-max-correction-px",
+        type=float,
+        default=3.0,
+        help="Maxima correccion permitida en pixeles para cada GCP. Valores mayores se rechazan por defecto.",
+    )
+    g.add_argument(
+        "--flow-clip-correction",
+        action="store_true",
+        help="En vez de rechazar correcciones mayores que --flow-max-correction-px, las escala al maximo permitido.",
+    )
 
     return parser
 
@@ -811,6 +828,9 @@ def main(argv=None):
     flow_crop_x_end = float(args.flow_crop_x_end)
     flow_crop_y_start = float(args.flow_crop_y_start)
     flow_crop_y_end = float(args.flow_crop_y_end)
+    flow_correction_sign = float(args.flow_correction_sign)
+    flow_max_correction_px = float(args.flow_max_correction_px)
+    flow_clip_correction = bool(args.flow_clip_correction)
 
     print("Configuracion principal:")
     print(f"  mission = {mission}")
@@ -1919,6 +1939,9 @@ def main(argv=None):
         "flow_crop_x_end": flow_crop_x_end,
         "flow_crop_y_start": flow_crop_y_start,
         "flow_crop_y_end": flow_crop_y_end,
+        "flow_correction_sign": flow_correction_sign,
+        "flow_max_correction_px": flow_max_correction_px,
+        "flow_clip_correction": flow_clip_correction,
     }
     corrected_config_file = corrected_points_dir / "_corrected_points_config.json"
 
@@ -1950,7 +1973,10 @@ def main(argv=None):
                 "--crop_x_end", str(flow_crop_x_end),
                 "--crop_y_start", str(flow_crop_y_start),
                 "--crop_y_end", str(flow_crop_y_end),
-            ],
+                "--flow_sign", str(flow_correction_sign),
+                "--max_correction_px", str(flow_max_correction_px),
+            ]
+            + (["--clip_correction"] if flow_clip_correction else []),
             check=True,
         )
 
