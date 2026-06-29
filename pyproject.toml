@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iss_simulation"
+version = "0.1"
+requires-python = "~= 3.11.0"
+dependencies = [
+    # Core numerical stack
+    "numpy<2",
+    "scipy",
+    "pandas",
+    "scikit-image",
+    "scikit-learn",
+
+    # Image processing
+    "opencv-python-headless<4.12",
+    "Pillow",
+    "matplotlib",
+
+    # Geospatial / astronomy
+    "astropy",
+    "skyfield",
+    "rasterio",
+    "shapely",
+    "cartopy",
+
+    # Utilities
+    "requests",
+    "tqdm",
+    "exifread",
+    "flow-vis",
+
+    # Deep learning
+    "torch",
+    "torchvision",
+    "lightning>=2.3,<2.4",
+]
+
+[project.optional-dependencies]
+blender = [ "bpy==4.4.0"]
+viz = ["rerun-sdk<0.23", "vismatch"]
