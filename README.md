@@ -32,13 +32,13 @@ Install the base requirements:
 
 ```bash
 python3 -m pip install --upgrade pip
-python3 -m pip install -r requirements.txt
+python3 -m pip install .
 ```
 
 Install the Blender-related requirements:
 
 ```bash
-python3 -m pip install -r requirements-blender.txt
+python3 -m pip install .[blender]
 ```
 
 After activating the virtual environment, `python` and `python3` should normally point to the same environment. In this README, `python3` is used explicitly for Linux compatibility.
