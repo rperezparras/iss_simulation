@@ -35,52 +35,113 @@ python3 -m pip install --upgrade pip
 python3 -m pip install .
 ```
 
+The base installation includes the recommended neural matcher, `vismatch`, using SuperPoint + LightGlue.
+
 Install the Blender-related requirements:
 
 ```bash
-python3 -m pip install .[blender]
+python3 -m pip install ".[blender]"
 ```
 
 After activating the virtual environment, `python` and `python3` should normally point to the same environment. In this README, `python3` is used explicitly for Linux compatibility.
 
-## Important dependency notes
-
-The pipeline uses Blender through Python (`bpy`). For this reason, the requirements pin some packages to avoid known compatibility problems:
-
-```text
-numpy<2
-opencv-python-headless<4.12
-```
-
-This is important because recent NumPy/OpenCV versions can be incompatible with some `bpy` builds.
-
-If you see an error similar to:
-
-```text
-A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x
-```
-
-run:
+If you use IPython, install and launch it from the virtual environment:
 
 ```bash
-python3 -m pip install "numpy<2" "opencv-python-headless<4.12" --force-reinstall
+python3 -m pip install ipython
+python3 -m IPython
 ```
 
-Then check:
+This avoids accidentally launching a system `ipython3` tied to a different Python installation.
+
+## Important dependency notes
+
+The pipeline uses Blender through Python (`bpy`) and `vismatch` as its recommended neural image matcher.
+
+The following versions are intentionally constrained because they form the currently tested compatible environment:
+
+```text
+Python ~= 3.11
+numpy < 2
+opencv-python >= 4.5.4, < 4.12
+lightning == 2.3.3
+vismatch == 1.3.1
+rerun-sdk < 0.23
+setuptools >= 61, < 81
+```
+
+These constraints are important for two reasons:
+
+1. Recent NumPy/OpenCV combinations can be incompatible with some `bpy` builds.
+2. `vismatch 1.3.2` requires newer Lightning and Setuptools versions than the environment currently used by this project and can also cause pip to upgrade NumPy/OpenCV when installed independently.
+
+For this reason, do **not** install or upgrade `vismatch` independently with an unconstrained command such as:
+
+```bash
+python3 -m pip install vismatch
+```
+
+Instead, install the project dependencies together:
+
+```bash
+python3 -m pip install .
+```
+
+This lets pip resolve the tested dependency set consistently.
+
+The project uses `opencv-python` rather than `opencv-python-headless` because `vismatch` directly depends on `opencv-python`. Installing both OpenCV distributions in the same environment should be avoided because both provide the `cv2` module.
+
+If an existing environment was modified by an incompatible `vismatch` installation, restore the tested versions with:
+
+```bash
+python3 -m pip install \
+  "numpy<2" \
+  "opencv-python>=4.5.4,<4.12" \
+  "lightning==2.3.3" \
+  "vismatch==1.3.1" \
+  "rerun-sdk<0.23" \
+  "setuptools>=61,<81"
+```
+
+Then check the main packages:
 
 ```bash
 python3 - <<'PY'
+import sys
 import numpy
 import cv2
-import bpy
+import torch
+import lightning
 import vismatch
 
+print("Python:", sys.version.split()[0])
 print("numpy:", numpy.__version__)
-print("cv2:", cv2.__version__)
-print("bpy OK")
-print("vismatch OK")
+print("opencv:", cv2.__version__)
+print("torch:", torch.__version__)
+print("lightning:", lightning.__version__)
+print("vismatch:", vismatch.__version__)
+print("CUDA:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
 PY
 ```
+
+To verify the actual neural matcher, not only the import:
+
+```bash
+python3 - <<'PY'
+import torch
+from vismatch import get_matcher
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print("device:", device)
+
+matcher = get_matcher("superpoint-lightglue", device=device)
+print("SuperPoint + LightGlue loaded successfully")
+PY
+```
+
+The first run may download model weights.
 
 ## External data
 
@@ -175,13 +236,9 @@ python3 -m pipelinentl.timelapse_pipeline \
 
 ## Matching backend
 
-The default matching backend is `vismatch`.
+The default matching backend is `vismatch`, using `superpoint-lightglue`.
 
-For a normal installation, no local matching repository path is needed:
-
-```bash
-python3 -m pip install vismatch
-```
+`vismatch` is installed together with the normal project dependencies. A separate `pip install vismatch` is neither required nor recommended because it can bypass the version constraints required by the rest of the project.
 
 The pipeline also keeps optional compatibility with the old `image-matching-models` repository. This is only for legacy local setups. If needed, define:
 
@@ -312,6 +369,50 @@ Make sure VS Code is using the same virtual environment:
 ```text
 Ctrl+Shift+P -> Python: Select Interpreter -> .venv/bin/python
 ```
+
+### `vismatch` or `torch` cannot be imported from IPython
+
+Check which interpreter IPython is using:
+
+```python
+import sys
+print(sys.executable)
+```
+
+It should point to the project's `.venv`.
+
+If it does not, install and launch IPython from the virtual environment:
+
+```bash
+python3 -m pip install ipython
+python3 -m IPython
+```
+
+### `pip check` reports `bpy 4.4.0 is not supported on this platform`
+
+On some Linux installations, `pip check` can report:
+
+```text
+bpy 4.4.0 is not supported on this platform
+```
+
+If `bpy` imports correctly, verify the actual runtime directly:
+
+```bash
+python3 - <<'PY'
+import sys
+import platform
+import bpy
+
+print("Python:", sys.version)
+print("System:", platform.system(), platform.machine())
+print("glibc:", platform.libc_ver())
+print("Blender/bpy:", bpy.app.version_string)
+print("bpy:", bpy.__file__)
+PY
+```
+
+If this reports Blender 4.4.0 from the project's `.venv`, the runtime installation is usable even if `pip check` still emits that platform warning.
 
 ### Data root not found
 
