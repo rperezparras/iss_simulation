@@ -163,9 +163,13 @@ def step_should_run(
     - faltan outputs suficientes.
 
     Si la configuración guardada no coincide, o si un paso anterior cambió,
-    se avisa pero NO se recalcula si los outputs ya están completos. Para
+    se avisa pero NO se recalcula si los outputs ya están completos.
+    NO se reemplaza la configuración guardada si el producto fue reutilizado. Para
     recalcular explícitamente se usan las flags --rerun-*.
     """
+    strict_refinement = label in (
+        "flujos ópticos", "puntos corregidos", "GeoTIFFs segunda georreferenciación"
+    )
     if force_this_step:
         print(f"   AVISO {label}: forzado por configuración.")
         return True
@@ -175,31 +179,47 @@ def step_should_run(
         return True
 
     if force_downstream:
+        if strict_refinement:
+            raise RuntimeError(
+                f"{label}: una etapa anterior cambió pero este resultado sigue en caché. "
+                "No se reutilizará silenciosamente: ejecuta las opciones --rerun-* "
+                "correspondientes, o usa reprocesar_refinamiento_v3.py."
+            )
         print(
             f"   AVISO {label}: un paso anterior cambió, pero los outputs están completos. "
             "Se reutilizan. Usa la flag --rerun-* correspondiente para recalcular."
         )
-        if config_file is not None and current_config is not None:
-            write_json(config_file, current_config)
+        # Never stamp an old product with a new configuration when it was NOT recomputed.
+        # For forced refinements use the isolated reprocessing driver included in this release.
         return False
 
     if config_file is not None and current_config is not None:
         old_config = read_json(config_file)
 
         if old_config is None:
+            if strict_refinement:
+                raise RuntimeError(
+                    f"{label}: productos existentes sin configuración verificable. "
+                    "Recalcula este paso o usa reprocesar_refinamiento_v3.py."
+                )
             print(
                 f"   AVISO {label}: outputs completos pero falta el archivo de configuración. "
-                "Se asumirá válido y se escribirá la configuración actual."
+                "Se conservarán sin atribuirles una configuración nueva."
             )
-            write_json(config_file, current_config)
+            # Keep provenance truthful: output has not been regenerated.
             return False
 
         if not configs_equal(old_config, current_config):
+            if strict_refinement:
+                raise RuntimeError(
+                    f"{label}: config distinta con productos antiguos. "
+                    "No se reutilizarán sin recomputar. Usa --rerun-* o el ejecutor v3."
+                )
             print(
                 f"   AVISO {label}: configuración distinta, pero outputs completos. "
                 "Se reutilizan. Usa la flag --rerun-* correspondiente para recalcular."
             )
-            write_json(config_file, current_config)
+            # Keep provenance truthful: output has not been regenerated.
             return False
 
     return False
@@ -540,6 +560,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     g.add_argument("--rerun-first-georef", dest="rerun_first_georef_if_exists", action="store_true")
     g.add_argument("--rerun-viirs", dest="rerun_viirs_if_exists", action="store_true")
     g.add_argument("--rerun-optical-flow", dest="rerun_optical_flow_if_exists", action="store_true")
+    g.add_argument("--flow-mask-margin-px", type=int, default=96)
+    g.add_argument("--flow-mask-feather-px", type=int, default=32)
+    g.add_argument("--flow-histogram-mode", choices=("masked", "legacy"), default="masked")
+    g.add_argument("--flow-coverage-mask-dir", default=None,
+                   help="Existing footprint masks; default: <base-dir>/flow/footprints")
     g.add_argument("--rerun-correct-points", dest="rerun_correct_points_if_exists", action="store_true")
     g.add_argument("--rerun-second-georef", dest="rerun_second_georef_if_exists", action="store_true")
 
@@ -1858,6 +1883,11 @@ def main(argv=None):
     flow_config = {
         **common_config,
         "step": "optical_flow",
+        "algorithm_version": "iss_viirs_masked_v2",
+        "mask_margin_px": int(args.flow_mask_margin_px),
+        "mask_feather_px": int(args.flow_mask_feather_px),
+        "histogram_mode": str(args.flow_histogram_mode),
+        "mask_dir": str(args.flow_coverage_mask_dir or (flow_dir / "footprints")),
         "optical_flow_plot_every": optical_flow_plot_every,
         "flow_crop_x_start": flow_crop_x_start,
         "flow_crop_x_end": flow_crop_x_end,
@@ -1891,6 +1921,12 @@ def main(argv=None):
                 "--geo_dir", str(geo_dir),
                 "--viirs_dir", str(viirs_output_dir),
                 "--flow_dir", str(flow_dir),
+                "--coverage_mask_dir", str(args.flow_coverage_mask_dir or (flow_dir / "footprints")),
+                "--source_images_dir", str(pics_dir),
+                "--points_dir", str(filtered_points_dir),
+                "--mask_margin_px", str(args.flow_mask_margin_px),
+                "--mask_feather_px", str(args.flow_mask_feather_px),
+                "--histogram_mode", str(args.flow_histogram_mode),
                 "--start_id", str(start_id),
                 "--end_id", str(end_id),
                 "--plot_every", str(optical_flow_plot_every),
@@ -1909,7 +1945,18 @@ def main(argv=None):
         write_json(flow_config_file, flow_config)
         force_downstream = True
     else:
-        print("   Se omite optical_flow: flujos suficientes y configuración válida.")
+        # A count of *.npy files is NOT proof that old flow fields have a mask.
+        for fp in flow_dir.glob("*_flow.npy"):
+            meta_fp = flow_dir / fp.name.replace("_flow.npy", "_flow_meta.json")
+            meta = read_json(meta_fp)
+            mask_name = meta.get("flow_valid_mask_file") if isinstance(meta, dict) else None
+            if (not meta or meta.get("pipeline_flow_algorithm") != "iss_viirs_masked_v2"
+                    or not mask_name or not (flow_dir / str(mask_name)).is_file()):
+                raise RuntimeError(
+                    f"Flujo anterior sin soporte válido: {fp}. "
+                    "Recalcula --rerun-optical-flow o usa reprocesar_refinamiento_v3.py."
+                )
+        print("   Se omite optical_flow: flujos y máscaras compatibles con la configuración.")
 
     n_flow = count_nonempty(flow_dir, "*_flow.npy")
     print(f"   Frames con flujo óptico: {n_flow}/{n_images}")
@@ -1931,6 +1978,7 @@ def main(argv=None):
     corrected_config = {
         **common_config,
         "step": "correct_points",
+        "algorithm_version": "original_gcps_subpixel_masked_flow_v2",
         "filtered_points_dir": str(filtered_points_dir),
         "flow_dir": str(flow_dir),
         "geo_dir": str(geo_dir),
@@ -1986,7 +2034,16 @@ def main(argv=None):
         write_json(corrected_config_file, corrected_config)
         force_downstream = True
     else:
-        print("   Se omite correct_points: puntos corregidos suficientes y configuración válida.")
+        # Old corrected.points files silently included pixel-truncation shifts.
+        # A config count alone must never certify these as new products.
+        for f in corrected_points_dir.glob("*_corrected.points"):
+            stat = read_json(f.with_name(f.name.replace("_corrected.points", "_correction_stats.json")))
+            if not stat or stat.get("mode") != "original_gcps_subpixel_masked_flow_v2":
+                raise RuntimeError(
+                    f"Puntos corregidos antiguos: {f}. "
+                    "Recalcula --rerun-correct-points o usa reprocesar_refinamiento_v3.py."
+                )
+        print("   Se omite correct_points: puntos corregidos con versión subpíxel verificada.")
 
     n_corrected_points = count_nonempty(corrected_points_dir, "*.points")
     print(f"   Frames con puntos corregidos: {n_corrected_points}/{n_images}")

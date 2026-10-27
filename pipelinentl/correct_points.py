@@ -22,8 +22,14 @@ def meta_path(flow_path):
     return p.with_name(p.name.replace("_flow.npy", "_flow_meta.json"))
 
 
-def pixel_to_geo(px, py, gt):
-    return gt[0] + px * gt[1] + py * gt[2], gt[3] + px * gt[4] + py * gt[5]
+def geo_to_pixel(x, y, gt):
+    """Map lon/lat to OpenCV center-based pixel indices (continuous)."""
+    det = gt[1] * gt[5] - gt[2] * gt[4]
+    if abs(det) < 1e-20:
+        raise ValueError("Non-invertible raster geotransform")
+    dx, dy = x - gt[0], y - gt[3]
+    # GDAL transform is corner-based; array index 0 samples the center at 0.5.
+    return (gt[5] * dx - gt[2] * dy) / det - 0.5, (-gt[4] * dx + gt[1] * dy) / det - 0.5
 
 
 def sign_from_meta(meta):
@@ -54,9 +60,20 @@ def bilinear(flow, x, y):
     return (1-wy)*((1-wx)*f00 + wx*f10) + wy*((1-wx)*f01 + wx*f11)
 
 
+def bilinear_mask_valid(mask, x, y):
+    """All 4 flow pixels used by bilinear interpolation must be valid."""
+    h, w = mask.shape
+    if not np.isfinite(x) or not np.isfinite(y) or x < 0 or y < 0 or x > w - 1 or y > h - 1:
+        return False
+    x0, y0 = int(np.floor(x)), int(np.floor(y))
+    x1, y1 = min(x0 + 1, w - 1), min(y0 + 1, h - 1)
+    return bool(mask[y0, x0] and mask[y0, x1] and mask[y1, x0] and mask[y1, x1])
+
+
 def correct_one(points_path, flow_path, mapping_path, geo_path, out_path,
                 cli_sign=None, use_cli_sign=False,
-                max_correction_px=0.0, enable_max_filter=False):
+                max_correction_px=0.0, enable_max_filter=False,
+                allow_legacy_flow=False):
     pts = pd.read_csv(points_path, comment="M")
     mp = pd.read_csv(mapping_path)
 
@@ -68,12 +85,18 @@ def correct_one(points_path, flow_path, mapping_path, geo_path, out_path,
             raise ValueError(f"Missing column {c} in {mapping_path}")
 
     if len(pts) != len(mp):
-        n = min(len(pts), len(mp))
-        print(f"AVISO {Path(points_path).name}: points={len(pts)}, mapping={len(mp)}; using first {n}")
-        pts = pts.iloc[:n].copy()
-        mp = mp.iloc[:n].copy()
-    else:
-        pts = pts.copy(); mp = mp.copy()
+        raise ValueError(
+            f"GCP count mismatch: points={len(pts)} mapping={len(mp)} "
+            f"for {points_path}; refusing to pair unmatched rows"
+        )
+    pts, mp = pts.copy(), mp.copy()
+    # Row ordering is essential: sampling the wrong GCP corrupts corrections.
+    for col in ("sourceX", "sourceY", "mapX", "mapY"):
+        if col in mp.columns:
+            p = pd.to_numeric(pts[col], errors="coerce").to_numpy(dtype=float)
+            m = pd.to_numeric(mp[col], errors="coerce").to_numpy(dtype=float)
+            if not np.allclose(p, m, atol=1e-5, rtol=0, equal_nan=True):
+                raise ValueError(f"GCP mapping rows are not aligned on {col}: {mapping_path}")
 
     flow = np.load(flow_path)
     if flow.ndim != 3 or flow.shape[2] != 2:
@@ -82,7 +105,23 @@ def correct_one(points_path, flow_path, mapping_path, geo_path, out_path,
     mpath = meta_path(flow_path)
     if not mpath.exists():
         raise FileNotFoundError(f"Missing flow metadata: {mpath}")
-    meta = json.load(open(mpath, encoding="utf-8"))
+    with open(mpath, encoding="utf-8") as f:
+        meta = json.load(f)
+    mask_file = meta.get("flow_valid_mask_file")
+    flow_valid_mask = None
+    if mask_file:
+        mask_path = Path(flow_path).parent / Path(mask_file).name
+        if not mask_path.is_file():
+            raise FileNotFoundError(f"Missing flow validity mask: {mask_path}")
+        flow_valid_mask = np.load(mask_path).astype(bool)
+        if flow_valid_mask.shape != flow.shape[:2]:
+            raise ValueError("Flow validity mask shape differs from optical flow")
+    elif not allow_legacy_flow:
+        raise ValueError(
+            f"Flow {flow_path} has no validity mask. "
+            "Recompute it with corrected optical_flow.py. "
+            "For a controlled quantization-only comparison use --allow_legacy_flow."
+        )
 
     ds = gdal.Open(geo_path)
     gt = ds.GetGeoTransform()
@@ -98,33 +137,54 @@ def correct_one(points_path, flow_path, mapping_path, geo_path, out_path,
     sign_source = "cli" if use_cli_sign and cli_sign is not None else "flow_meta"
 
     new_mapx, new_mapy = [], []
-    dxs, dys, rawdxs, rawdys, insides, applied, mags, reasons = [], [], [], [], [], [], [], []
+    dxs, dys, rawdxs, rawdys, insides, valid_samples, applied, mags, reasons = [], [], [], [], [], [], [], [], []
+    sample_pixels_x, sample_pixels_y = [], []
 
-    for px, py, oldx, oldy in zip(pd.to_numeric(mp["geoX"], errors="coerce"),
-                                  pd.to_numeric(mp["geoY"], errors="coerce"),
-                                  pts["mapX"], pts["mapY"]):
+    # Calculate true subpixel GCP location directly from original geographic
+    # coordinates, NEVER from truncated legacy pixel_mapping.csv columns.
+    for oldx, oldy in zip(pd.to_numeric(pts["mapX"], errors="coerce"),
+                          pd.to_numeric(pts["mapY"], errors="coerce")):
+        if np.isfinite(oldx) and np.isfinite(oldy):
+            px, py = geo_to_pixel(float(oldx), float(oldy), gt)
+        else:
+            px, py = float("nan"), float("nan")
+        sample_pixels_x.append(px); sample_pixels_y.append(py)
         dx = dy = rawdx = rawdy = 0.0
-        inside = app = 0
+        inside = valid_sample = app = 0
         reason = "outside_flow_roi"
         if np.isfinite(px) and np.isfinite(py):
-            f = bilinear(flow, float(px)-x0, float(py)-y0)
+            rx, ry = float(px)-x0, float(py)-y0
+            f = bilinear(flow, rx, ry)
             if f is not None:
                 inside = 1
-                rawdx, rawdy = sign*float(f[0]), sign*float(f[1])
-                mag = float(np.hypot(rawdx, rawdy))
-                if enable_max_filter and max_correction_px > 0 and mag > max_correction_px:
-                    reason = "too_large_filtered"
+                if flow_valid_mask is not None and not bilinear_mask_valid(flow_valid_mask, rx, ry):
+                    reason = "invalid_iss_footprint_or_margin"
                 else:
-                    dx, dy = rawdx, rawdy
-                    app = int(mag > 1e-9)
-                    reason = "applied" if app else "zero_flow"
-            mx, my = pixel_to_geo(float(px)+dx, float(py)+dy, gt)
+                    valid_sample = 1
+                    rawdx, rawdy = sign*float(f[0]), sign*float(f[1])
+                    mag = float(np.hypot(rawdx, rawdy))
+                    if not np.isfinite(mag):
+                        reason = "non_finite_flow"
+                        rawdx = rawdy = 0.0
+                    elif enable_max_filter and max_correction_px > 0 and mag > max_correction_px:
+                        reason = "too_large_filtered"
+                    else:
+                        dx, dy = rawdx, rawdy
+                        app = int(mag > 1e-9)
+                        reason = "applied" if app else "zero_flow"
+            # IMPORTANT: keep the exact original geographic GCP coordinates.
+            # The legacy script converted integer-truncated pixel_mapping values
+            # back to lon/lat even when no flow was applied, causing a hidden
+            # quantization shift. Apply ONLY the affine displacement vector.
+            mx = float(oldx) + gt[1] * dx + gt[2] * dy
+            my = float(oldy) + gt[4] * dx + gt[5] * dy
         else:
-            mx, my = oldx, oldy
+            mx, my = float(oldx), float(oldy)
             reason = "non_finite_mapping_pixel"
         new_mapx.append(mx); new_mapy.append(my)
         dxs.append(dx); dys.append(dy); rawdxs.append(rawdx); rawdys.append(rawdy)
-        insides.append(inside); applied.append(app); mags.append(float(np.hypot(dx,dy))); reasons.append(reason)
+        insides.append(inside); valid_samples.append(valid_sample)
+        applied.append(app); mags.append(float(np.hypot(dx,dy))); reasons.append(reason)
 
     out = pd.DataFrame({
         "mapX": new_mapx,
@@ -139,10 +199,13 @@ def correct_one(points_path, flow_path, mapping_path, geo_path, out_path,
         "dY_raw": rawdys,
         "correction_mag": mags,
         "flow_inside": insides,
+        "flow_valid": valid_samples,
         "flow_applied": applied,
         "correction_reason": reasons,
-        "geoX_first": pd.to_numeric(mp["geoX"], errors="coerce").to_numpy(),
-        "geoY_first": pd.to_numeric(mp["geoY"], errors="coerce").to_numpy(),
+        "geoX_first": sample_pixels_x,
+        "geoY_first": sample_pixels_y,
+        "geoX_mapping_legacy": pd.to_numeric(mp["geoX"], errors="coerce").to_numpy(),
+        "geoY_mapping_legacy": pd.to_numeric(mp["geoY"], errors="coerce").to_numpy(),
     })
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -150,29 +213,36 @@ def correct_one(points_path, flow_path, mapping_path, geo_path, out_path,
 
     arr = np.asarray(mags, float)
     stats = {
-        "mode": "original_points_only_exact_flow_sample",
+        "mode": "original_gcps_subpixel_masked_flow_v2",
+        "pixel_sample_source": "inverse_geotransform_of_original_mapX_mapY",
+        "used_legacy_unmasked_flow": bool(flow_valid_mask is None),
         "no_dense_points_added": True,
+        "preserve_original_geographic_coordinates_when_no_flow": True,
         "no_max_pixel_limit_applied": not bool(enable_max_filter),
         "flow_sign_used": sign,
         "flow_sign_source": sign_source,
         "flow_sign_cli_received": cli_sign,
         "n_points": int(len(out)),
         "inside_flow_count": int(np.sum(insides)),
+        "valid_flow_count": int(np.sum(valid_samples)),
+        "rejected_by_footprint_or_margin": int(np.sum(np.array(insides) & ~np.array(valid_samples, dtype=bool))),
+        "mask_margin_px": int(meta.get("mask_margin_px", -1)),
         "applied_count": int(np.sum(applied)),
         "reason_counts": {str(k): int(v) for k, v in pd.Series(reasons).value_counts().to_dict().items()},
         "roi": {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "width": x1-x0, "height": y1-y0},
         "flow_definition": meta.get("flow_definition"),
         "flow_correction": meta.get("correction_to_apply_in_correct_points"),
         "correction_mag_percentiles": {
-            "p50": float(np.percentile(arr, 50)),
-            "p90": float(np.percentile(arr, 90)),
-            "p95": float(np.percentile(arr, 95)),
-            "max": float(np.max(arr)),
+            "p50": float(np.percentile(arr, 50)) if arr.size else None,
+            "p90": float(np.percentile(arr, 90)) if arr.size else None,
+            "p95": float(np.percentile(arr, 95)) if arr.size else None,
+            "max": float(np.max(arr)) if arr.size else None,
         },
     }
     sp = out_path.replace("_corrected.points", "_correction_stats.json")
-    json.dump(stats, open(sp, "w", encoding="utf-8"), indent=2, ensure_ascii=False)
-    print(f"OK {out_path} | simple original points | inside={stats['inside_flow_count']}/{stats['n_points']} | applied={stats['applied_count']}/{stats['n_points']} | sign={sign} ({sign_source})")
+    with open(sp, "w", encoding="utf-8") as f:
+        json.dump(stats, f, indent=2, ensure_ascii=False)
+    print(f"OK {out_path} | inside={stats['inside_flow_count']}/{stats['n_points']} | valid={stats['valid_flow_count']}/{stats['n_points']} | applied={stats['applied_count']}/{stats['n_points']} | sign={sign} ({sign_source})")
 
 
 def main():
@@ -192,6 +262,8 @@ def main():
     ap.add_argument("--max_correction_px", type=float, default=0.0)  # ignored unless --enable_max_correction_filter
     ap.add_argument("--enable_max_correction_filter", action="store_true")
     ap.add_argument("--clip_correction", action="store_true")  # legacy ignored
+    ap.add_argument("--allow_legacy_flow", action="store_true",
+                    help="Only for comparison: use an old flow without a validity mask")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -219,6 +291,7 @@ def main():
                 use_cli_sign=args.use_cli_flow_sign,
                 max_correction_px=float(args.max_correction_px),
                 enable_max_filter=args.enable_max_correction_filter,
+                allow_legacy_flow=args.allow_legacy_flow,
             )
         except Exception as e:
             errors += 1

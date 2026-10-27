@@ -158,8 +158,14 @@ def save_pixel_mapping(gcps, geo_image_path, mapping_file):
     geotransform = dataset.GetGeoTransform()
 
     def geo_to_pixel(mapX, mapY, geotransform):
-        px = int((mapX - geotransform[0]) / geotransform[1])
-        py = int((mapY - geotransform[3]) / geotransform[5])
+        gt = geotransform
+        det = gt[1] * gt[5] - gt[2] * gt[4]
+        if abs(det) < 1e-20:
+            raise ValueError("Non-invertible geotransform")
+        dx, dy = float(mapX) - gt[0], float(mapY) - gt[3]
+        # GDAL is corner-based; arrays/optical flow index pixel centers.
+        px = (gt[5] * dx - gt[2] * dy) / det - 0.5
+        py = (-gt[4] * dx + gt[1] * dy) / det - 0.5
         return px, py
 
     with open(mapping_file, "w") as f:
@@ -311,7 +317,7 @@ def process_image(
 
     save_pixel_mapping(gcps_dict, output_path, mapping_file)
 
-    if idx % plot_every == 0:
+    if plot_every > 0 and idx % plot_every == 0:
         plot_path = os.path.join(output_dir, base + "_comparison.png")
         plot_georef_comparison(image_path, points_path, output_path, mapping_file, plot_path)
 
@@ -376,6 +382,7 @@ def process_timelapse_parallel(
     start_id,
     end_id,
     plot_every,
+    nproc=None,
 ):
     all_images = sorted([
         os.path.splitext(f)[0]
@@ -412,14 +419,19 @@ def process_timelapse_parallel(
         print("Nada que hacer: todas las imágenes del rango parecen ya procesadas.")
         return
 
-    nproc = min(8, cpu_count())
+    nproc = min(8, cpu_count()) if nproc is None else min(cpu_count(), max(1, int(nproc)))
     print(f"🔵 Usando {nproc} procesos para georreferenciación.\n")
 
     with Pool(nproc) as pool:
         results = pool.map(process_one_with_idx, tasks)
 
+    errors = []
     for res in results:
         print(res)
+        if res.startswith(("❌", "⛔", "⚠️")):
+            errors.append(res)
+    if errors:
+        raise RuntimeError(f"Georreferenciacion incompleta: {len(errors)} errores de {len(results)} tareas")
 
 
 # ------------------------------------------------------------
@@ -437,6 +449,8 @@ def main():
     parser.add_argument("--input_dir", type=str, required=True)
     parser.add_argument("--points_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--nproc", type=int, default=0,
+                        help="Procesos GDAL paralelos; 0 mantiene el valor predeterminado (hasta 8)")
 
     args = parser.parse_args()
 
@@ -456,6 +470,7 @@ def main():
         start_id=args.start_id,
         end_id=args.end_id,
         plot_every=args.plot_every,
+        nproc=(args.nproc if args.nproc > 0 else None),
     )
 
 
